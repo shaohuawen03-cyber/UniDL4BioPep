@@ -150,6 +150,17 @@ def parse_args():
                    help="amPEPpy 模型 .pkl 路径(未提供则跳过该工具)")
     a.add_argument("--ampep-threshold", type=float, default=0.5)
 
+    y = p.add_argument_group("Ma et al. 2022 模型 (ATT / LSTM, 不含 BERT)")
+    y.add_argument("--ma-models", nargs="*", default=[],
+                   choices=["ATT", "LSTM"],
+                   help="启用马跃模型, 如 --ma-models ATT LSTM")
+    y.add_argument("--ma-att-h5", default=None, help="10att.h5 路径")
+    y.add_argument("--ma-lstm-h5", default=None, help="10lstm.h5 路径")
+    y.add_argument("--ma-threshold", type=float, default=0.5,
+                   help="判阳阈值 (原文与后续研究均用 0.5)")
+    y.add_argument("--ma-max-len", type=int, default=50,
+                   help="马跃模型训练域上限(50 aa); 超长序列标记为 NA 而非外推")
+
     p.add_argument("--dedup", action="store_true", default=True)
     p.add_argument("--no-dedup", dest="dedup", action="store_false")
     p.add_argument("--max-seqs", type=int, default=0,
@@ -404,6 +415,79 @@ def to_prob(pred):
 
 
 # ==========================================
+# 5b. Ma et al. 2022 模型 (ATT / LSTM)
+# ==========================================
+
+# 官方 format.pl 的整数编码表(A=1 ... Y=20), 左侧 0 填充至 300 维
+MA_AACODE = {a: i + 1 for i, a in enumerate("ACDEFGHIKLMNPQRSTVWY")}
+MA_MAXLEN = 300
+
+
+def ma_encode(seqs):
+    """复刻 c_AMPs-prediction/format.pl 的编码: 整数映射 + 左侧零填充到 300。"""
+    X = np.zeros((len(seqs), MA_MAXLEN), dtype=np.float32)
+    for i, s in enumerate(seqs):
+        codes = [MA_AACODE.get(ch, 0) for ch in s[-MA_MAXLEN:]]
+        X[i, MA_MAXLEN - len(codes):] = codes
+    return X
+
+
+def load_ma_models(args):
+    """
+    加载马跃 ATT / LSTM 模型。
+    仅用 ATT+LSTM 而不含 BERT 有直接文献先例:
+    J Gerontol A Biol Sci 2024 (百岁老人肠道 AMP) 明确
+    "选择其中两个(ATT 和 LSTM)作为本研究使用的模型", 阈值同为 0.5。
+    """
+    loaded = {}
+    if not args.ma_models:
+        return loaded
+    paths = {"ATT": args.ma_att_h5, "LSTM": args.ma_lstm_h5}
+    for key in args.ma_models:
+        p_ = paths.get(key)
+        if not p_ or not os.path.exists(p_):
+            print(f"⚠️ 未提供/找不到 {key} 权重, 跳过 (--ma-{key.lower()}-h5)")
+            continue
+        try:
+            if key == "ATT":
+                # 自定义 Attention_layer, 需与仓库的 Attention.py 同目录或可导入
+                try:
+                    from Attention import Attention_layer
+                except ImportError:
+                    sys.path.insert(0, os.path.dirname(os.path.abspath(p_)))
+                    from Attention import Attention_layer
+                m = load_model(p_, custom_objects={
+                    "Attention_layer": Attention_layer})
+            else:
+                m = load_model(p_)
+            loaded[f"Ma{key}"] = m
+            print(f"✅ Ma et al. {key}: {p_}")
+        except Exception as e:
+            print(f"⚠️ 加载 Ma {key} 失败: {e}")
+            print("   提示: 该模型为旧版 Keras .h5, 建议用独立环境")
+    return loaded
+
+
+def ma_predict(model, seqs, max_len, batch_size=1024):
+    """
+    返回概率数组; 超出训练域(>max_len aa)的序列置 NaN, 不做外推。
+    马跃模型训练数据为 <=50 aa (getorf -maxsize 150 nt)。
+    """
+    probs = np.full(len(seqs), np.nan, dtype=np.float32)
+    idx = [i for i, s in enumerate(seqs) if len(s) <= max_len]
+    if not idx:
+        return probs
+    X = ma_encode([seqs[i] for i in idx])
+    pred = np.asarray(model.predict(X, batch_size=batch_size, verbose=0))
+    if pred.ndim == 2 and pred.shape[1] == 2:
+        pred = pred[:, 1]
+    else:
+        pred = pred.reshape(-1)
+    probs[np.array(idx)] = pred
+    return probs
+
+
+# ==========================================
 # 6. Macrel
 # ==========================================
 
@@ -547,7 +631,7 @@ def collect_groups(catalog_dir, cohort_filter, include_total):
 # ==========================================
 
 def run_group(cohort, group, fasta, encoder, models, use_macrel,
-              use_ampep, out_dir, ckpt_dir, args):
+              use_ampep, ma_models, out_dir, ckpt_dir, args):
     gout = os.path.join(out_dir, cohort)
     os.makedirs(gout, exist_ok=True)
 
@@ -561,7 +645,8 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
             return json.load(fh)
 
     tool_names = (list(models) + (["Macrel"] if use_macrel else [])
-                  + (["amPEPpy"] if use_ampep else []))
+                  + (["amPEPpy"] if use_ampep else [])
+                  + list(ma_models))
 
     start_chunk = 0
     funnel = {"n_raw": 0, "n_after_len": 0, "n_after_physchem": 0,
@@ -689,6 +774,17 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
             n_pos += cls
             del X
         del feats
+
+        # ---------- ④b Ma et al. ATT / LSTM ----------
+        for mname, mmodel in ma_models.items():
+            mp = ma_predict(mmodel, seqs, args.ma_max_len,
+                            args.predict_batch_size)
+            df[f"{mname}_prob"] = mp
+            mc = (np.nan_to_num(mp) >= args.ma_threshold).astype(np.int8)
+            df[f"{mname}_class"] = mc
+            pstats[mname].update(mp[~np.isnan(mp)])
+            n_hits[mname] += int(mc.sum())
+            n_pos += mc
 
         # ---------- ⑤ 共识 ----------
         df["n_tools_positive"] = n_pos
@@ -832,7 +928,9 @@ def main():
             print("⚠️ 检测到 ampep 但未提供 --ampep-model, 跳过该工具")
         # 未安装时静默跳过
 
-    n_tools = len(args.models) + int(use_macrel) + int(use_ampep)
+    ma_models = load_ma_models(args)
+    n_tools = (len(args.models) + int(use_macrel) + int(use_ampep)
+               + len(ma_models))
     print(f"🗳 共识工具数: {n_tools}")
     if n_tools < 2:
         print("   ⚠️ 单工具模式假阳性偏高, 强烈建议至少加装 Macrel")
@@ -852,7 +950,8 @@ def main():
         print("=" * 70)
         try:
             all_sum.append(run_group(c, g, f, encoder, models, use_macrel,
-                                     use_ampep, out_dir, ckpt_dir, args))
+                                     use_ampep, ma_models, out_dir,
+                                     ckpt_dir, args))
         except Exception as e:
             import traceback
             print(f"❌ {c}/{g} 失败: {e}")
