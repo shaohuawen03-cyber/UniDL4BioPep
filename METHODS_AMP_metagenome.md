@@ -297,4 +297,64 @@ python amp_group_stats.py ~/UniDL4BioPep-main/Predictions_AMP_run1/
 
 ---
 
+
+---
+
 *文档随代码维护，对应提交见 `git log -- METHODS_AMP_metagenome.md`*
+
+---
+
+## 9. AD 关联分析（`amp_ad_association.py`）
+
+课题落脚点为**疾病关联**，故在候选筛选之上补充以下分析。
+
+### 9.1 家族级去冗余（前置必需步骤）
+
+序列级计数会把同一 AMP 家族的多个变体重复计入，**系统性夸大组间差异**。
+AMPSphere（*Cell* 2024）用 CD-HIT 在 **100% / 85% / 75%** 三个层级聚类
+（每层称一个 SPHERE，90% 覆盖度），并在家族层面开展生态学分析。
+
+本流程默认采用其 **75% identity / 90% coverage** 参数，统计单元由"序列"
+改为"家族"。未安装 cd-hit 时自动降级为序列级并给出警告。
+
+```bash
+conda install -c bioconda cd-hit diamond
+```
+
+### 9.2 Cochran-Armitage 趋势检验（核心方法）
+
+本数据的独特优势在于 **NC → SCS → SCD → MCI → AD 是有序的 5 阶段**，
+而非简单二分类。因此采用 Cochran-Armitage trend test 检验**单调趋势**：
+
+- 结论形式为"AMP 家族密度随疾病进程单调上升"，**强于**"AD 组高于 NC 组"
+- 充分利用中间三个阶段的信息，而两两比较会浪费这部分数据
+- 配合 BH FDR 校正控制多重比较
+
+**统计单元说明**：趋势检验以家族**检出数**（丰度）为计数单元；同时输出各
+阶段的**唯一序列数**（`nseq_*` 列，代表家族内多样性）。两者生物学含义不同，
+分别报告。
+
+### 9.3 输出
+
+| 文件 | 内容 |
+|---|---|
+| `family_trend_test.tsv` | 各家族的 CA 趋势检验（核心结果），含各阶段 ρ |
+| `stage_specific_families.tsv` | AD 特异 / NC 特异家族 |
+| `physchem_by_stage.tsv` | 候选肽理化性质的阶段漂移 |
+| `candidates_annotated.tsv.gz` | 带家族注释的候选肽全表 |
+
+### 9.4 新颖性比对（可选）
+
+提供 `--known-amp-db` 时用 DIAMOND 比对已知 AMP 库，以 **identity < 40%**
+判定新颖——该阈值取自 Ma et al.（*Nat Biotechnol* 2022），该研究即以
+"多数肽与训练集 AMP 同源性 <40%"论证其发现的新颖性。
+
+可用数据库：APD3、dbAMP、DRAMP、AMPSphere（https://ampsphere.big-data-biology.org/）。
+
+### 9.5 验证记录
+
+- Cochran-Armitage 实现经算例验证：单调上升 z=3.95（p=7.7e-5）、
+  无趋势 z=0、单调下降 z=-3.95，符号与量值均正确。
+- 端到端验证：在 200 个背景家族中植入 5 个递增家族（2→8→20→45→90），
+  全部检出且**零假阳性**。
+- BH FDR 实现经标准算例核对。

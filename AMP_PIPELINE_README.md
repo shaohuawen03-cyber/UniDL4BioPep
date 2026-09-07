@@ -117,3 +117,14 @@ python run_amp_sorf_cohorts.py --ampep-model /path/to/ampep_model.pkl
 ```
 
 备选：ampir (R, mature 模型) / AMPScanner v2 / AMPlify。
+
+## AD 关联分析
+
+```bash
+conda install -c bioconda cd-hit diamond
+python amp_ad_association.py Predictions_AMP_run1/ --cohort Cohort3
+```
+
+做四件事：CD-HIT 家族级去冗余(对齐 AMPSphere 75%/90%) → Cochran-Armitage
+阶段趋势检验(利用 NC→SCS→SCD→MCI→AD 有序性) → AD/NC 特异家族 →
+理化性质阶段漂移。可选 `--known-amp-db` 做新颖性比对。
