@@ -199,6 +199,26 @@ class ESMEncoder:
 # 4. 抗菌肽模型加载
 # ==========================================
 
+def all_files_of(d):
+    return sorted(os.listdir(d))
+
+
+def _try_load_scaler(path):
+    """依次尝试 pickle / joblib 加载 scaler, 失败返回 None。"""
+    try:
+        with open(path, "rb") as fh:
+            obj = pickle.load(fh)
+    except Exception:
+        try:
+            import joblib
+            obj = joblib.load(path)
+        except Exception:
+            return None
+    if not hasattr(obj, "transform"):
+        return None
+    return obj
+
+
 def load_amp_models(root_dir, model_keys):
     """返回 {name: (scaler, keras_model)}, 优先使用 keras_2 版本。"""
     loaded = {}
@@ -215,21 +235,38 @@ def load_amp_models(root_dir, model_keys):
         k2 = [f for f in keras_files if "keras_2" in f]
         model_file = k2[0] if k2 else keras_files[0]
         prefix = model_file.split("_")[0]
-        # 与模型对应的 scaler
+        # 与模型对应的 scaler: 按优先级逐个尝试, 有的文件可能损坏/是 joblib 格式
         cands = [
+            f"{prefix}_working_scaler.pkl",
             f"{prefix}_keras_2_minmax_scaler.pkl" if "keras_2" in model_file else None,
             f"{prefix}_minmax_scaler.pkl",
-            f"{prefix}_working_scaler.pkl",
             "minmax_scaler.pkl",
+            f"{prefix}.joblib",
         ]
-        scaler_path = next(
-            (os.path.join(fpath, c) for c in cands
-             if c and os.path.exists(os.path.join(fpath, c))), None)
-        if scaler_path is None:
-            print(f"⚠️ 找不到 scaler, 跳过: {folder}")
+        cands = [c for c in cands if c]
+        # 兜底: 目录下其余所有 pkl/joblib
+        cands += sorted(f for f in all_files_of(fpath)
+                        if f.endswith((".pkl", ".joblib")) and f not in cands)
+
+        scaler, scaler_path = None, None
+        for c in cands:
+            p = os.path.join(fpath, c)
+            if not os.path.exists(p):
+                continue
+            s = _try_load_scaler(p)
+            if s is not None:
+                scaler, scaler_path = s, p
+                break
+            print(f"   ↷ scaler 不可用, 尝试下一个: {c}")
+        if scaler is None:
+            print(f"⚠️ 该目录没有可用 scaler, 跳过: {folder}")
             continue
-        with open(scaler_path, "rb") as fh:
-            scaler = pickle.load(fh)
+
+        nfeat = getattr(scaler, "n_features_in_", None)
+        if nfeat is not None and nfeat != 320:
+            print(f"⚠️ {folder}: scaler 期望 {nfeat} 维, 与 ESM-2 320 维不符, 跳过")
+            continue
+
         model = load_model(os.path.join(fpath, model_file))
         loaded[key] = (scaler, model)
         print(f"✅ 载入模型 {key}: {model_file} | scaler: {os.path.basename(scaler_path)}")
