@@ -86,3 +86,34 @@ Predictions_AMP_*/
    `--min-tools` 或 `--min-charge`。
 4. Cohort1/2 与 Cohort3/4 样本高度重叠，Cohort2 是 Cohort1 的两个组，
    报告时不要当作独立重复。
+
+---
+
+## 组间统计分析
+
+预测跑完后运行：
+
+```bash
+python amp_group_stats.py Predictions_AMP_run1/
+```
+
+输出四张表，解决"绝对数量不可比"：
+
+| 文件 | 内容 |
+|---|---|
+| `group_stats_rhoAMP.tsv` | ρAMP 归一化密度(c_AMP 数 / smORF 总数) |
+| `group_stats_tool_concordance.tsv` | 跨工具 Spearman 一致性(ρ>0.8 才可下结论) |
+| `group_stats_group_tests.tsv` | 各组 vs NC 的两比例 z 检验 + BH FDR + fold change |
+| `group_stats_ks_tests.tsv` | 概率分布 KS 检验(不依赖阈值) |
+
+详细方法学与文献依据见 **`METHODS_AMP_metagenome.md`**。
+
+## 第三个工具(推荐)
+
+两工具是下限，三工具才能"≥2 票"投票。代码已预留 amPEPpy 接口：
+
+```bash
+python run_amp_sorf_cohorts.py --ampep-model /path/to/ampep_model.pkl
+```
+
+备选：ampir (R, mature 模型) / AMPScanner v2 / AMPlify。

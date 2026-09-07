@@ -141,6 +141,15 @@ def parse_args():
     m.add_argument("--macrel-bin", default="macrel")
     m.add_argument("--macrel-threads", type=int, default=4)
 
+    a = p.add_argument_group("amPEPpy (第三票, 可选)")
+    a.add_argument("--ampep", action="store_true", default=True,
+                   help="启用 amPEPpy(需已安装 ampep 且已 train 出模型)")
+    a.add_argument("--no-ampep", dest="ampep", action="store_false")
+    a.add_argument("--ampep-bin", default="ampep")
+    a.add_argument("--ampep-model", default=None,
+                   help="amPEPpy 模型 .pkl 路径(未提供则跳过该工具)")
+    a.add_argument("--ampep-threshold", type=float, default=0.5)
+
     p.add_argument("--dedup", action="store_true", default=True)
     p.add_argument("--no-dedup", dest="dedup", action="store_false")
     p.add_argument("--max-seqs", type=int, default=0,
@@ -467,6 +476,49 @@ def run_macrel_peptides(binary, ids, seqs, threads=4):
     return res
 
 
+def check_ampep(binary, model):
+    """检测 amPEPpy 是否可用(需要二进制 + 已训练模型)。"""
+    if shutil.which(binary) is None:
+        return None
+    if not model or not os.path.exists(model):
+        return "no_model"
+    return "ok"
+
+
+def run_ampep(binary, model, seqs, threshold=0.5, threads=4):
+    """调用 amPEPpy predict, 返回 {index: prob}。"""
+    res = {}
+    with tempfile.TemporaryDirectory(prefix="ampep_") as td:
+        fa = os.path.join(td, "in.faa")
+        with open(fa, "w") as fh:
+            for i, s in enumerate(seqs):
+                fh.write(f">p{i}\n{s}\n")
+        out = os.path.join(td, "out.tsv")
+        cmd = [binary, "predict", "-m", model, "-i", fa, "-o", out,
+               "-d", "-t", str(threads)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0 or not os.path.exists(out):
+                print(f"   ⚠️ amPEPpy 失败: {r.stderr.strip()[-300:]}")
+                return res
+            df = pd.read_csv(out, sep="\t")
+        except Exception as e:
+            print(f"   ⚠️ amPEPpy 调用失败: {e}")
+            return res
+        cols = {c.lower(): c for c in df.columns}
+        c_id = cols.get("seq_id") or df.columns[0]
+        c_pr = cols.get("probability_amp") or cols.get("probability") or df.columns[-1]
+        for _, row in df.iterrows():
+            k = str(row[c_id])
+            if not k.startswith("p"):
+                continue
+            try:
+                res[int(k[1:])] = float(row[c_pr])
+            except (ValueError, TypeError):
+                continue
+    return res
+
+
 # ==========================================
 # 7. 分组枚举
 # ==========================================
@@ -495,7 +547,7 @@ def collect_groups(catalog_dir, cohort_filter, include_total):
 # ==========================================
 
 def run_group(cohort, group, fasta, encoder, models, use_macrel,
-              out_dir, ckpt_dir, args):
+              use_ampep, out_dir, ckpt_dir, args):
     gout = os.path.join(out_dir, cohort)
     os.makedirs(gout, exist_ok=True)
 
@@ -508,7 +560,8 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
         with open(summ_json) as fh:
             return json.load(fh)
 
-    tool_names = list(models) + (["Macrel"] if use_macrel else [])
+    tool_names = (list(models) + (["Macrel"] if use_macrel else [])
+                  + (["amPEPpy"] if use_ampep else []))
 
     start_chunk = 0
     funnel = {"n_raw": 0, "n_after_len": 0, "n_after_physchem": 0,
@@ -605,6 +658,21 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
             pstats["Macrel"].update(mprob[valid])
             n_hits["Macrel"] += int(mcls.sum())
             n_pos += mcls
+
+        # ---------- ③b amPEPpy ----------
+        if use_ampep:
+            ares = run_ampep(args.ampep_bin, args.ampep_model, seqs,
+                             args.ampep_threshold, args.macrel_threads)
+            aprob = np.full(len(seqs), np.nan, dtype=np.float32)
+            for i, pr in ares.items():
+                if i < len(seqs):
+                    aprob[i] = pr
+            acls = (np.nan_to_num(aprob) >= args.ampep_threshold).astype(np.int8)
+            df["amPEPpy_prob"] = aprob
+            df["amPEPpy_class"] = acls
+            pstats["amPEPpy"].update(aprob[~np.isnan(aprob)])
+            n_hits["amPEPpy"] += int(acls.sum())
+            n_pos += acls
 
         # ---------- ④ UniDL4BioPep ----------
         feats = encoder.encode(seqs, batch_size=args.esm_batch_size,
@@ -754,6 +822,21 @@ def main():
             print("⚠️ 未检测到 Macrel, 将只用 UniDL4BioPep(单工具, 假阳性偏高)。")
             print("   安装: conda install -c bioconda macrel")
 
+    use_ampep = False
+    if args.ampep:
+        st = check_ampep(args.ampep_bin, args.ampep_model)
+        if st == "ok":
+            print(f"✅ amPEPpy 可用: {args.ampep_model}")
+            use_ampep = True
+        elif st == "no_model":
+            print("⚠️ 检测到 ampep 但未提供 --ampep-model, 跳过该工具")
+        # 未安装时静默跳过
+
+    n_tools = len(args.models) + int(use_macrel) + int(use_ampep)
+    print(f"🗳 共识工具数: {n_tools}")
+    if n_tools < 2:
+        print("   ⚠️ 单工具模式假阳性偏高, 强烈建议至少加装 Macrel")
+
     print(f"🧪 理化预筛: {'开启' if args.physchem_filter else '关闭'} "
           f"(净电荷 >= {args.min_charge}, 疏水比例 >= "
           f"{args.min_hydrophobic_frac}, 长度 {args.min_len}-{args.max_len})")
@@ -769,7 +852,7 @@ def main():
         print("=" * 70)
         try:
             all_sum.append(run_group(c, g, f, encoder, models, use_macrel,
-                                     out_dir, ckpt_dir, args))
+                                     use_ampep, out_dir, ckpt_dir, args))
         except Exception as e:
             import traceback
             print(f"❌ {c}/{g} 失败: {e}")
