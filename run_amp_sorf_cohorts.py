@@ -73,6 +73,84 @@ AMP_MODEL_DIRS = {
 
 VALID_AA = set("ACDEFGHIKLMNPQRSTVWY")
 
+# 概率分布统计: 直方图分箱数 与 报告阈值
+N_BINS = 1000
+REPORT_THRESHOLDS = [0.5, 0.9, 0.95, 0.99, 0.999]
+
+
+class ProbStats:
+    """常数内存的概率分布统计器(直方图 + 分位数近似)。"""
+
+    def __init__(self, n_bins=N_BINS):
+        self.n_bins = n_bins
+        self.hist = np.zeros(n_bins, dtype=np.int64)
+        self.n = 0
+        self.sum = 0.0
+
+    def update(self, probs):
+        probs = np.asarray(probs, dtype=np.float64)
+        idx = np.clip((probs * self.n_bins).astype(int), 0, self.n_bins - 1)
+        self.hist += np.bincount(idx, minlength=self.n_bins)
+        self.n += probs.size
+        self.sum += float(probs.sum())
+
+    def to_dict(self):
+        if self.n == 0:
+            return {}
+        edges = (np.arange(self.n_bins) + 0.5) / self.n_bins
+        cum = np.cumsum(self.hist)
+        qs = {}
+        for q in (0.5, 0.75, 0.9, 0.99, 0.999, 0.9999):
+            k = int(np.searchsorted(cum, q * self.n))
+            qs[f"P{q*100:g}"] = round(float(edges[min(k, self.n_bins - 1)]), 4)
+        counts = {}
+        for t in REPORT_THRESHOLDS:
+            b = int(t * self.n_bins)
+            counts[str(t)] = int(self.hist[b:].sum())
+        return {
+            "n": self.n,
+            "mean_prob": round(self.sum / self.n, 4),
+            "quantiles": qs,
+            "counts_at_threshold": counts,
+            "rates_at_threshold": {k: round(v / self.n, 6)
+                                   for k, v in counts.items()},
+        }
+
+    def state(self):
+        return {"hist": self.hist.tolist(), "n": self.n, "sum": self.sum}
+
+    @classmethod
+    def from_state(cls, st):
+        o = cls(len(st["hist"]))
+        o.hist = np.array(st["hist"], dtype=np.int64)
+        o.n, o.sum = st["n"], st["sum"]
+        return o
+
+
+class LenStats:
+    """长度统计(用于核对输入分布是否落在模型训练范围内)。"""
+
+    def __init__(self):
+        self.n = 0
+        self.sum = 0
+
+    def update(self, lens):
+        self.n += len(lens)
+        self.sum += int(np.sum(lens))
+
+    def to_dict(self):
+        return {"n": self.n,
+                "mean_len": round(self.sum / self.n, 2) if self.n else 0}
+
+    def state(self):
+        return {"n": self.n, "sum": self.sum}
+
+    @classmethod
+    def from_state(cls, st):
+        o = cls()
+        o.n, o.sum = st["n"], st["sum"]
+        return o
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="分组宏基因组 sORF 抗菌肽预测")
@@ -92,9 +170,10 @@ def parse_args():
     p.add_argument("--predict-batch-size", type=int, default=4096)
     p.add_argument("--threshold", type=float, default=0.5,
                    help="判为阳性的概率阈值")
-    p.add_argument("--min-len", type=int, default=5)
-    p.add_argument("--max-len", type=int, default=100,
-                   help="AMP 模型面向短肽, 过长序列建议过滤")
+    p.add_argument("--min-len", type=int, default=11,
+                   help="默认 11, 对齐 AMP 训练集长度下限")
+    p.add_argument("--max-len", type=int, default=180,
+                   help="默认 180, 对齐 AMP 训练集长度上限(11-180, 中位数 101)")
     p.add_argument("--dedup", action="store_true", default=True,
                    help="组内序列去重(默认开启)")
     p.add_argument("--no-dedup", dest="dedup", action="store_false")
@@ -330,12 +409,19 @@ def run_group(cohort, group, fasta, encoder, models, out_dir, ckpt_dir, args):
 
     start_chunk = 0
     stats = {"n_scored": 0, "n_hits": {k: 0 for k in models}}
+    pstats = {k: ProbStats() for k in models}
+    lstats = LenStats()
     if os.path.exists(ckpt_file):
         with open(ckpt_file) as fh:
             ck = json.load(fh)
         start_chunk = ck["next_chunk"]
         stats = ck["stats"]
         stats["n_hits"] = {k: stats["n_hits"].get(k, 0) for k in models}
+        for k in models:
+            if k in ck.get("pstats", {}):
+                pstats[k] = ProbStats.from_state(ck["pstats"][k])
+        if "lstats" in ck:
+            lstats = LenStats.from_state(ck["lstats"])
         print(f"🔁 断点续跑: 从 chunk {start_chunk} 继续")
     else:
         # 新建输出文件(写表头)
@@ -368,12 +454,14 @@ def run_group(cohort, group, fasta, encoder, models, out_dir, ckpt_dir, args):
             prob = to_prob(model.predict(
                 X, batch_size=args.predict_batch_size, verbose=0))
             df[f"{name}_prob"] = prob.astype(np.float32)
+            pstats[name].update(prob)
             cls = (prob >= args.threshold)
             df[f"{name}_class"] = cls.astype(np.int8)
             stats["n_hits"][name] += int(cls.sum())
             hit_mask |= cls
             del X
         stats["n_scored"] += len(seqs)
+        lstats.update(df["length"].values)
 
         hits = df[hit_mask]
         if len(hits):
@@ -386,7 +474,9 @@ def run_group(cohort, group, fasta, encoder, models, out_dir, ckpt_dir, args):
             all_header_written = True
 
         with open(ckpt_file, "w") as fh:
-            json.dump({"next_chunk": ci + 1, "stats": stats}, fh)
+            json.dump({"next_chunk": ci + 1, "stats": stats,
+                       "pstats": {k: v.state() for k, v in pstats.items()},
+                       "lstats": lstats.state()}, fh)
 
         del df, feats, hits
         gc.collect()
@@ -410,13 +500,23 @@ def run_group(cohort, group, fasta, encoder, models, out_dir, ckpt_dir, args):
                      for k, v in stats["n_hits"].items()},
         "elapsed_sec": round(elapsed, 1),
         "hits_file": hits_file,
+        "length_stats": lstats.to_dict(),
+        "prob_distribution": {k: v.to_dict() for k, v in pstats.items()},
     }
+    # 概率直方图另存, 便于后续任意阈值重新统计 / 画图
+    for k, v in pstats.items():
+        np.save(os.path.join(gout, f"{group}_{k}_prob_hist.npy"), v.hist)
     with open(summ_json, "w") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
     pd.DataFrame([{
         "Cohort": cohort, "Group": group, "N_scored": stats["n_scored"],
         **{f"N_hits_{k}": v for k, v in stats["n_hits"].items()},
         **{f"HitRate_{k}": round(summary["hit_rate"][k], 6) for k in stats["n_hits"]},
+        **{f"{k}_{lbl}": val
+           for k, v in summary["prob_distribution"].items()
+           for lbl, val in list(v.get("quantiles", {}).items())
+           + [(f"n@{t}", v.get("counts_at_threshold", {}).get(t))
+              for t in v.get("counts_at_threshold", {})]},
     }]).to_csv(os.path.join(gout, f"{group}_summary.tsv"), sep="\t", index=False)
 
     print(f"💾 {cohort}/{group} 完成: {stats['n_scored']:,} 条, "
@@ -468,9 +568,16 @@ def main():
         for s in all_summaries:
             row = {"Cohort": s["cohort"], "Group": s["group"],
                    "N_scored": s["n_scored"]}
+            row["mean_len"] = s.get("length_stats", {}).get("mean_len")
             for k, v in s["n_hits"].items():
                 row[f"N_hits_{k}"] = v
                 row[f"HitRate_{k}"] = round(s["hit_rate"][k], 6)
+            for k, d in s.get("prob_distribution", {}).items():
+                row[f"{k}_mean_prob"] = d.get("mean_prob")
+                for lbl, val in d.get("quantiles", {}).items():
+                    row[f"{k}_{lbl}"] = val
+                for t, val in d.get("rates_at_threshold", {}).items():
+                    row[f"{k}_rate@{t}"] = val
             rows.append(row)
         pd.DataFrame(rows).to_csv(
             os.path.join(out_dir, "summary_all_groups.tsv"),
