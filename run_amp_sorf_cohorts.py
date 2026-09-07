@@ -92,6 +92,36 @@ AMP_MODEL_DIRS = {
 
 VALID_AA = set("ACDEFGHIKLMNPQRSTVWY")
 
+# ==========================================
+# 各工具的原生训练长度域 (aa)
+# 每个工具只对自己域内的序列打分, 域外输出 NaN 不外推。
+#   Macrel        : 在 (meta)genome 中只输出 10-100 aa 的 smORF (PeerJ 2020)
+#   UniDL4BioPep  : AMP 训练集长度 11-180 aa (本地 AMP_train.csv 核实)
+#   Ma-ATT/LSTM   : getorf -maxsize 150 nt = 50 aa; 仓库标明 "under 50AA"
+#                   (Nat Biotechnol 2022, github.com/mayuefine/c_AMPs-prediction)
+#   amPEPpy       : 无严格上限, 沿用 AmPEP 常用范围
+# ==========================================
+TOOL_DOMAIN = {
+    "Macrel":  (10, 100),
+    "AMP":     (11, 180),   # UniDL4BioPep AMP
+    "AB":      (11, 180),   # UniDL4BioPep antibacterial
+    "MaATT":   (5,  50),
+    "MaLSTM":  (5,  50),
+    "amPEPpy": (10, 200),
+}
+
+
+def domain_mask(lengths, tool):
+    lo, hi = TOOL_DOMAIN.get(tool, (0, 10 ** 6))
+    return (lengths >= lo) & (lengths <= hi)
+
+
+def union_domain(tools):
+    """所有启用工具的长度域并集, 作为全局预过滤范围。"""
+    los = [TOOL_DOMAIN.get(t, (0, 10 ** 6))[0] for t in tools]
+    his = [TOOL_DOMAIN.get(t, (0, 10 ** 6))[1] for t in tools]
+    return (min(los) if los else 10), (max(his) if his else 180)
+
 N_BINS = 1000
 REPORT_THRESHOLDS = [0.5, 0.9, 0.95, 0.99, 0.999]
 
@@ -118,9 +148,14 @@ def parse_args():
     p.add_argument("--threshold", type=float, default=0.5,
                    help="UniDL4BioPep 判阳阈值(概率分布会同时报告多档)")
 
-    # --- 长度: 对齐 Macrel 的 smORF 范围 ---
-    p.add_argument("--min-len", type=int, default=10)
-    p.add_argument("--max-len", type=int, default=100)
+    # --- 长度: 默认取所有启用工具的域【并集】, 各工具再各自按域打分 ---
+    p.add_argument("--min-len", type=int, default=None,
+                   help="全局最小长度; 缺省=启用工具长度域并集的下界")
+    p.add_argument("--max-len", type=int, default=None,
+                   help="全局最大长度; 缺省=启用工具长度域并集的上界")
+    p.add_argument("--length-strata", nargs="*", type=int,
+                   default=[10, 50, 100, 180],
+                   help="分层统计的长度分界(各工具域不同, 需分层比较)")
 
     # --- 理化预筛 (AMPSphere / Zhang & Gallo 2016) ---
     g = p.add_argument_group("理化预筛")
@@ -167,6 +202,13 @@ def parse_args():
                    help=">0 时每组只处理前 N 条(试跑)")
     p.add_argument("--min-tools", type=int, default=1,
                    help="写入 hits 所需的最少判阳工具数(2 = 取交集)")
+    p.add_argument("--consensus-mode", default="count",
+                   choices=["count", "frac"],
+                   help="count=按绝对票数; frac=按'判阳/可评'比例。"
+                        "各工具长度域不同, 长肽可评工具数更少, "
+                        "count 模式会系统性丢弃长肽, 建议用 frac")
+    p.add_argument("--min-consensus-frac", type=float, default=1.0,
+                   help="frac 模式下的阈值(1.0=所有可评工具都判阳)")
     return p.parse_args()
 
 
@@ -652,7 +694,15 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
     funnel = {"n_raw": 0, "n_after_len": 0, "n_after_physchem": 0,
               "n_scored": 0}
     n_hits = {t: 0 for t in tool_names}
+    n_eval = {t: 0 for t in tool_names}   # 各工具"域内可评"序列数
     n_consensus = {str(k): 0 for k in range(1, len(tool_names) + 1)}
+    # 按长度分层的命中统计(各工具域不同, 必须分层比较)
+    strata = sorted(set(args.length_strata))
+    strata_labels = ([f"<{strata[0]}"]
+                     + [f"{strata[i]}-{strata[i+1]}" for i in range(len(strata)-1)]
+                     + [f">{strata[-1]}"])
+    n_stratum = {lb: 0 for lb in strata_labels}
+    n_stratum_hit = {lb: {t: 0 for t in tool_names} for lb in strata_labels}
     pstats = {t: ProbStats() for t in tool_names}
     charge_m, len_m, pi_m = RunningMean(), RunningMean(), RunningMean()
 
@@ -662,7 +712,10 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
         start_chunk = ck["next_chunk"]
         funnel = ck["funnel"]
         n_hits = {t: ck["n_hits"].get(t, 0) for t in tool_names}
+        n_eval = {t: ck.get("n_eval", {}).get(t, 0) for t in tool_names}
         n_consensus = ck.get("n_consensus", n_consensus)
+        n_stratum = ck.get("n_stratum", n_stratum)
+        n_stratum_hit = ck.get("n_stratum_hit", n_stratum_hit)
         for t in tool_names:
             if t in ck.get("pstats", {}):
                 pstats[t] = ProbStats.from_state(ck["pstats"][t])
@@ -699,7 +752,10 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
                 print(f"   chunk{ci}: 理化预筛后为空, 跳过")
                 with open(ckpt_file, "w") as fh:
                     json.dump({"next_chunk": ci + 1, "funnel": funnel,
-                               "n_hits": n_hits, "n_consensus": n_consensus,
+                               "n_hits": n_hits, "n_eval": n_eval,
+                               "n_consensus": n_consensus,
+                               "n_stratum": n_stratum,
+                               "n_stratum_hit": n_stratum_hit,
                                "pstats": {k: v.state() for k, v in pstats.items()},
                                "charge": charge_m.state(), "len": len_m.state(),
                                "pi": pi_m.state()}, fh)
@@ -723,76 +779,124 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
         })
 
         n_pos = np.zeros(len(seqs), dtype=np.int8)
+        n_evaluable = np.zeros(len(seqs), dtype=np.int8)
 
         # ---------- ③ Macrel ----------
         if use_macrel:
-            mres = run_macrel_peptides(args.macrel_bin, ids, seqs,
-                                       args.macrel_threads)
+            dmask = domain_mask(props["length"], "Macrel")
+            didx = np.flatnonzero(dmask)
             mprob = np.full(len(seqs), np.nan, dtype=np.float32)
             mcls = np.zeros(len(seqs), dtype=np.int8)
             mhem = [""] * len(seqs)
-            for i, (pr, isamp, hem) in mres.items():
-                if i < len(seqs):
-                    mprob[i] = pr
-                    mcls[i] = int(isamp)
-                    mhem[i] = hem
+            if didx.size:
+                sub = [seqs[i] for i in didx]
+                mres = run_macrel_peptides(args.macrel_bin,
+                                           [ids[i] for i in didx], sub,
+                                           args.macrel_threads)
+                for j, (pr, isamp, hem) in mres.items():
+                    if j < len(didx):
+                        g = didx[j]
+                        mprob[g] = pr
+                        mcls[g] = int(isamp)
+                        mhem[g] = hem
             df["Macrel_prob"] = mprob
             df["Macrel_class"] = mcls
             df["Macrel_hemolytic"] = mhem
-            valid = ~np.isnan(mprob)
-            pstats["Macrel"].update(mprob[valid])
+            df["Macrel_in_domain"] = dmask.astype(np.int8)
+            pstats["Macrel"].update(mprob[~np.isnan(mprob)])
             n_hits["Macrel"] += int(mcls.sum())
+            n_eval["Macrel"] += int(dmask.sum())
             n_pos += mcls
+            n_evaluable += dmask.astype(np.int8)
 
         # ---------- ③b amPEPpy ----------
         if use_ampep:
-            ares = run_ampep(args.ampep_bin, args.ampep_model, seqs,
-                             args.ampep_threshold, args.macrel_threads)
+            dmask = domain_mask(props["length"], "amPEPpy")
+            didx = np.flatnonzero(dmask)
             aprob = np.full(len(seqs), np.nan, dtype=np.float32)
-            for i, pr in ares.items():
-                if i < len(seqs):
-                    aprob[i] = pr
+            if didx.size:
+                ares = run_ampep(args.ampep_bin, args.ampep_model,
+                                 [seqs[i] for i in didx],
+                                 args.ampep_threshold, args.macrel_threads)
+                for j, pr in ares.items():
+                    if j < len(didx):
+                        aprob[didx[j]] = pr
             acls = (np.nan_to_num(aprob) >= args.ampep_threshold).astype(np.int8)
             df["amPEPpy_prob"] = aprob
             df["amPEPpy_class"] = acls
+            df["amPEPpy_in_domain"] = dmask.astype(np.int8)
             pstats["amPEPpy"].update(aprob[~np.isnan(aprob)])
             n_hits["amPEPpy"] += int(acls.sum())
+            n_eval["amPEPpy"] += int(dmask.sum())
             n_pos += acls
+            n_evaluable += dmask.astype(np.int8)
 
         # ---------- ④ UniDL4BioPep ----------
         feats = encoder.encode(seqs, batch_size=args.esm_batch_size,
                                desc=f"{cohort}/{group} c{ci} ({len(seqs)})")
         for name, (scaler, model) in models.items():
+            dmask = domain_mask(props["length"], name)
             X = scaler.transform(feats)
-            prob = to_prob(model.predict(X, batch_size=args.predict_batch_size,
+            praw = to_prob(model.predict(X, batch_size=args.predict_batch_size,
                                          verbose=0))
-            df[f"UniDL_{name}_prob"] = prob.astype(np.float32)
-            cls = (prob >= args.threshold).astype(np.int8)
+            prob = np.where(dmask, praw, np.nan).astype(np.float32)
+            df[f"UniDL_{name}_prob"] = prob
+            cls = ((np.nan_to_num(prob) >= args.threshold) & dmask).astype(np.int8)
             df[f"UniDL_{name}_class"] = cls
-            pstats[name].update(prob)
+            df[f"UniDL_{name}_in_domain"] = dmask.astype(np.int8)
+            pstats[name].update(prob[~np.isnan(prob)])
             n_hits[name] += int(cls.sum())
+            n_eval[name] += int(dmask.sum())
             n_pos += cls
+            n_evaluable += dmask.astype(np.int8)
             del X
         del feats
 
         # ---------- ④b Ma et al. ATT / LSTM ----------
         for mname, mmodel in ma_models.items():
-            mp = ma_predict(mmodel, seqs, args.ma_max_len,
+            dmask = domain_mask(props["length"], mname)
+            mp = ma_predict(mmodel, seqs, TOOL_DOMAIN[mname][1],
                             args.predict_batch_size)
             df[f"{mname}_prob"] = mp
-            mc = (np.nan_to_num(mp) >= args.ma_threshold).astype(np.int8)
+            mc = ((np.nan_to_num(mp) >= args.ma_threshold) & dmask).astype(np.int8)
             df[f"{mname}_class"] = mc
+            df[f"{mname}_in_domain"] = dmask.astype(np.int8)
             pstats[mname].update(mp[~np.isnan(mp)])
             n_hits[mname] += int(mc.sum())
+            n_eval[mname] += int(dmask.sum())
             n_pos += mc
+            n_evaluable += dmask.astype(np.int8)
 
         # ---------- ⑤ 共识 ----------
         df["n_tools_positive"] = n_pos
-        df["n_tools_total"] = len(tool_names)
+        # 分母改为"该序列有几个工具够格评", 而非固定工具总数
+        df["n_tools_evaluable"] = n_evaluable
+        df["consensus_frac"] = np.where(n_evaluable > 0,
+                                        n_pos / np.maximum(n_evaluable, 1), 0.0)
         for k in range(1, len(tool_names) + 1):
             n_consensus[str(k)] += int((n_pos >= k).sum())
 
-        hits = df[n_pos >= args.min_tools]
+        # 长度分层统计
+        L = props["length"]
+        bins = np.digitize(L, strata)
+        for bi, lb in enumerate(strata_labels):
+            m = bins == bi
+            if not m.any():
+                continue
+            n_stratum[lb] += int(m.sum())
+            for t in tool_names:
+                col = (f"UniDL_{t}_class" if f"UniDL_{t}_class" in df.columns
+                       else f"{t}_class")
+                if col in df.columns:
+                    n_stratum_hit[lb][t] += int(df[col].values[m].sum())
+
+        if args.consensus_mode == "frac":
+            frac = np.where(n_evaluable > 0,
+                            n_pos / np.maximum(n_evaluable, 1), 0.0)
+            sel = (frac >= args.min_consensus_frac) & (n_evaluable > 0)
+        else:
+            sel = n_pos >= args.min_tools
+        hits = df[sel]
         if len(hits):
             hits.to_csv(hits_file, mode="a", index=False,
                         header=not header_written)
@@ -800,7 +904,10 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
 
         with open(ckpt_file, "w") as fh:
             json.dump({"next_chunk": ci + 1, "funnel": funnel,
-                       "n_hits": n_hits, "n_consensus": n_consensus,
+                       "n_hits": n_hits, "n_eval": n_eval,
+                       "n_consensus": n_consensus,
+                       "n_stratum": n_stratum,
+                       "n_stratum_hit": n_stratum_hit,
                        "pstats": {k: v.state() for k, v in pstats.items()},
                        "charge": charge_m.state(), "len": len_m.state(),
                        "pi": pi_m.state()}, fh)
@@ -839,8 +946,17 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
         },
         "funnel": funnel,
         "n_hits": n_hits,
+        "n_evaluable_per_tool": n_eval,
+        "tool_domains": {t: list(TOOL_DOMAIN.get(t, (0, 0)))
+                         for t in tool_names},
+        # 命中率分母用"该工具域内可评序列数", 而非全部打分序列
+        "hit_rate_in_domain": {t: round(n_hits[t] / n_eval[t], 6)
+                               if n_eval.get(t) else 0.0 for t in n_hits},
         "hit_rate_vs_scored": {t: round(v / n, 6) if n else 0.0
                                for t, v in n_hits.items()},
+        "length_strata": {"bins": strata,
+                          "n_per_stratum": n_stratum,
+                          "n_hits_per_stratum": n_stratum_hit},
         "n_consensus": n_consensus,
         "consensus_rate_vs_raw": {k: round(v / n_raw, 8)
                                   for k, v in n_consensus.items()},
@@ -931,7 +1047,30 @@ def main():
     ma_models = load_ma_models(args)
     n_tools = (len(args.models) + int(use_macrel) + int(use_ampep)
                + len(ma_models))
-    print(f"🗳 共识工具数: {n_tools}")
+
+    # 依据启用工具自动确定全局长度范围(各工具域的并集)
+    active = (list(args.models) + (["Macrel"] if use_macrel else [])
+              + (["amPEPpy"] if use_ampep else []) + list(ma_models))
+    u_lo, u_hi = union_domain(active)
+    if args.min_len is None:
+        args.min_len = u_lo
+    if args.max_len is None:
+        args.max_len = u_hi
+    print(f"📏 全局长度范围(工具域并集): {args.min_len}-{args.max_len} aa")
+    for t in active:
+        lo, hi = TOOL_DOMAIN.get(t, (0, 0))
+        print(f"     {t:<10} 训练域 {lo}-{hi} aa"
+              + ("  ← 域外输出 NaN, 不外推" if (lo, hi) != (args.min_len,
+                                                          args.max_len) else ""))
+    print(f"🗳 共识工具数: {n_tools}  (模式: {args.consensus_mode})")
+    if args.consensus_mode == "count" and args.min_tools > 1:
+        narrow = [t for t in active
+                  if TOOL_DOMAIN.get(t, (0, 1e6))[1] < u_hi]
+        if narrow:
+            print(f"   ⚠️ count 模式 + --min-tools {args.min_tools}: "
+                  f"长度超出 {narrow} 训练域的序列可评工具数不足, "
+                  f"将被系统性丢弃")
+            print(f"      如需保留长肽, 改用 --consensus-mode frac")
     if n_tools < 2:
         print("   ⚠️ 单工具模式假阳性偏高, 强烈建议至少加装 Macrel")
 
