@@ -108,6 +108,11 @@ def _dedup_pass(input_fa, tmpdir):
     uniq_fa = os.path.join(tmpdir, "uniq.faa")
     seen = {}
     n_total = 0
+    t0 = time.time()
+    fsize = os.path.getsize(input_fa)
+    nxt = 2_000_000
+    print(f"   [1/3] 去重中 (读取 {fsize/1024**3:.2f} GB, 单线程, 请耐心)...",
+          flush=True)
     with open(uniq_fa, "w") as out:
         for h, seq in iter_fasta(input_fa):
             n_total += 1
@@ -115,6 +120,15 @@ def _dedup_pass(input_fa, tmpdir):
                 idx = len(seen)
                 seen[seq] = idx
                 out.write(f">u{idx}\n{seq}\n")
+            if n_total >= nxt:
+                el = time.time() - t0
+                print(f"         已读 {n_total/1e6:.0f}M 条 | 唯一 "
+                      f"{len(seen)/1e6:.1f}M ({len(seen)/n_total*100:.0f}%) "
+                      f"| {el/60:.1f} 分 | {n_total/el/1000:.0f}k 条/秒",
+                      flush=True)
+                nxt += 2_000_000
+    print(f"   [1/3] 去重完成: {n_total:,} 条, 耗时 {(time.time()-t0)/60:.1f} 分",
+          flush=True)
     return uniq_fa, n_total, seen
 
 
@@ -189,8 +203,8 @@ def run_antifam(input_fa, antifam_hmm, output_fa, threads=8,
             parts.append(fp)
         del buf
 
-        print(f"   比对: {n_search:,} 条 / {len(parts)} 块 "
-              f"/ {workers} 进程 × {per_cpu} 线程")
+        print(f"   [2/3] 比对: {n_search:,} 条 / {len(parts)} 块 "
+              f"/ {workers} 进程 × {per_cpu} 线程", flush=True)
 
         # ---------- 并行 hmmsearch ----------
         def _one(fp):
@@ -237,6 +251,7 @@ def run_antifam(input_fa, antifam_hmm, output_fa, threads=8,
             bad_seq = {sq for sq, i in seen.items() if i in bad_idx}
             n_spur_uniq = len(bad_seq)
             del seen
+            print(f"   [3/3] 写出过滤后 FASTA ...", flush=True)
             n_kept = 0
             n_removed = 0
             with open(output_fa, "w") as out:
