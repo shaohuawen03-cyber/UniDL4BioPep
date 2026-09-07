@@ -175,6 +175,8 @@ def parse_args():
     m.add_argument("--no-macrel", dest="macrel", action="store_false")
     m.add_argument("--macrel-bin", default="macrel")
     m.add_argument("--macrel-threads", type=int, default=4)
+    m.add_argument("--macrel-threshold", type=float, default=0.5,
+                   help="Macrel AMP_probability 判阳阈值(官方默认 0.5)")
 
     a = p.add_argument_group("amPEPpy (第三票, 可选)")
     a.add_argument("--ampep", action="store_true", default=True,
@@ -545,7 +547,7 @@ def check_macrel(binary):
         return None
 
 
-def run_macrel_peptides(binary, ids, seqs, threads=4):
+def run_macrel_peptides(binary, ids, seqs, threads=4, threshold=0.5):
     """
     对一批肽调用 `macrel peptides`, 返回 {id: (prob, is_amp, hemolytic)}。
     使用 --keep-negatives 以获得全部序列的分数。
@@ -583,6 +585,8 @@ def run_macrel_peptides(binary, ids, seqs, threads=4):
         c_prob = cols.get("amp_probability") or cols.get("probability")
         c_cls = cols.get("amp_family") or cols.get("is_amp") or cols.get("class")
         c_hem = cols.get("hemolytic")
+        if c_prob is None:
+            print(f"   ⚠️ Macrel 输出缺少概率列, 现有列: {list(df.columns)}")
         for _, row in df.iterrows():
             key = str(row[c_acc])
             if not key.startswith("p"):
@@ -592,11 +596,17 @@ def run_macrel_peptides(binary, ids, seqs, threads=4):
             except ValueError:
                 continue
             prob = float(row[c_prob]) if c_prob else np.nan
-            if c_cls is not None:
-                v = str(row[c_cls])
-                is_amp = v not in ("NAMP", "nan", "0", "False")
+            # 判阳优先用概率: Macrel 官方判据是 AMP_probability >= 0.5。
+            # 不能用 AMP_family —— 它是【家族名】(ADP/ALP/...) 而非二分类标签,
+            # 配合 --keep-negatives 时任何非 "NAMP" 值都会被误判为阳性,
+            # 导致 100% 判阳。
+            if not np.isnan(prob):
+                is_amp = prob >= threshold
+            elif c_cls is not None:
+                v = str(row[c_cls]).strip().upper()
+                is_amp = v not in ("NAMP", "NAN", "0", "FALSE", "", "-")
             else:
-                is_amp = prob >= 0.5
+                is_amp = False
             hem = str(row[c_hem]) if c_hem else ""
             res[i] = (prob, bool(is_amp), hem)
     return res
@@ -792,7 +802,8 @@ def run_group(cohort, group, fasta, encoder, models, use_macrel,
                 sub = [seqs[i] for i in didx]
                 mres = run_macrel_peptides(args.macrel_bin,
                                            [ids[i] for i in didx], sub,
-                                           args.macrel_threads)
+                                           args.macrel_threads,
+                                           args.macrel_threshold)
                 for j, (pr, isamp, hem) in mres.items():
                     if j < len(didx):
                         g = didx[j]
