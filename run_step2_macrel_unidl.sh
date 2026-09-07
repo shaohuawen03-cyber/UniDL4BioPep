@@ -25,7 +25,15 @@ set -euo pipefail
 ROOT="${ROOT:-$HOME/UniDL4BioPep-main}"
 CLEAN="${CLEAN:-$ROOT/clean_catalog}"
 OUT="${OUT:-$ROOT/Predictions_AMP_run1}"
-MACREL_BIN="${MACREL_BIN:-$HOME/miniconda3/envs/env_macrel/bin/macrel}"
+# macrel: 直接用绝对路径调用外部二进制, 无需 conda activate
+# (环境若以 -p 创建, conda activate <名字> 会失败, 这里不受影响)
+if [ -z "${MACREL_BIN:-}" ]; then
+  for c in "$HOME/miniconda3/envs/env_macrel/bin/macrel" \
+           "$HOME/miniconda3/envs"/*/bin/macrel; do
+    [ -x "$c" ] && { MACREL_BIN="$c"; break; }
+  done
+fi
+MACREL_BIN="${MACREL_BIN:-}"
 COHORT="${1:-}"
 
 # ---- A4000 16GB 调优 ----
@@ -49,9 +57,10 @@ if [ ! -d "$CLEAN" ]; then
   CLEAN="$ROOT/comparable_sorf_grouped_catalog"
 fi
 
-[ -x "$MACREL_BIN" ] || {
-  echo "❌ 未找到 macrel: $MACREL_BIN"
-  echo "   在 env_macrel 中执行 'which macrel' 并设置 MACREL_BIN=..."
+[ -n "$MACREL_BIN" ] && [ -x "$MACREL_BIN" ] || {
+  echo "❌ 未找到 macrel 可执行文件"
+  echo "   查找: ls /home/wsh/miniconda3/envs/*/bin/macrel"
+  echo "   指定: MACREL_BIN=/path/to/macrel bash $0"
   exit 1; }
 echo "✅ Macrel: $($MACREL_BIN --version 2>&1 | head -1)"
 

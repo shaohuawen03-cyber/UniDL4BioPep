@@ -16,6 +16,12 @@ set -euo pipefail
 ROOT="${ROOT:-$HOME/UniDL4BioPep-main}"
 CATALOG="${CATALOG:-$ROOT/comparable_sorf_grouped_catalog}"
 CLEAN="${CLEAN:-$ROOT/clean_catalog}"
+ANTIFAM="${ANTIFAM:-}"
+if [ -z "$ANTIFAM" ]; then
+  for c in "$HOME/db/antifam/AntiFam.hmm" "$HOME/db/AntiFam.hmm"; do
+    [ -f "$c" ] && { ANTIFAM="$c"; break; }
+  done
+fi
 ANTIFAM="${ANTIFAM:-$HOME/db/antifam/AntiFam.hmm}"
 THREADS="${THREADS:-16}"
 FILTER="${1:-}"
@@ -27,8 +33,26 @@ echo " 输出: $CLEAN"
 echo " 线程: $THREADS"
 echo "=========================================================="
 
-command -v hmmsearch >/dev/null 2>&1 || {
-  echo "❌ 未找到 hmmsearch，请先: conda install -c bioconda hmmer"; exit 1; }
+# hmmsearch: 优先用当前环境里的绝对路径(环境可能是 -p 路径创建、名字不可用)
+HMMSEARCH="${HMMSEARCH:-}"
+if [ -z "$HMMSEARCH" ]; then
+  if [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/hmmsearch" ]; then
+    HMMSEARCH="$CONDA_PREFIX/bin/hmmsearch"
+  elif command -v hmmsearch >/dev/null 2>&1; then
+    HMMSEARCH="$(command -v hmmsearch)"
+  fi
+fi
+[ -n "$HMMSEARCH" ] && [ -x "$HMMSEARCH" ] || {
+  echo "❌ 未找到 hmmsearch"
+  echo "   运行: bash install_step1_deps.sh"
+  echo "   或指定: HMMSEARCH=/path/to/hmmsearch bash $0"
+  exit 1; }
+export HMMSEARCH
+echo "✅ hmmsearch: $HMMSEARCH"
+if [ -f "$ANTIFAM" ] && [ ! -f "$ANTIFAM.h3i" ]; then
+  echo "⚠️  AntiFam 未建索引，正在 hmmpress ..."
+  "$(dirname "$HMMSEARCH")/hmmpress" -f "$ANTIFAM"
+fi
 [ -f "$ANTIFAM" ] || {
   echo "❌ 未找到 $ANTIFAM"
   echo "   mkdir -p ~/db/antifam && cd ~/db/antifam"
@@ -65,7 +89,8 @@ find "$CATALOG" -mindepth 2 -name '*.fa' | sort | while read -r fa; do
       --antifam-db "$ANTIFAM" \
       --output "$out" \
       --report "$rep" \
-      --threads "$THREADS" 2>&1 | tee -a "$LOG"
+      --threads "$THREADS" \
+      --hmmsearch-bin "$HMMSEARCH" 2>&1 | tee -a "$LOG"
 done
 
 echo ""

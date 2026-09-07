@@ -97,13 +97,18 @@ def iter_fasta(path):
 # ==========================================
 
 def run_antifam(input_fa, antifam_hmm, output_fa, threads=8,
-                evalue=1e-3, report=None, chunk=500000):
+                evalue=1e-3, report=None, chunk=500000,
+                hmmsearch_bin="hmmsearch"):
     """
     用 hmmsearch 对 AntiFam 比对, 移除命中的 spurious ORF。
     返回 (n_total, n_spurious)。
     """
-    if not have("hmmsearch"):
-        sys.exit("❌ 未找到 hmmsearch (conda install -c bioconda hmmer)")
+    hs = hmmsearch_bin or "hmmsearch"
+    if os.path.isabs(hs):
+        if not os.access(hs, os.X_OK):
+            sys.exit(f"❌ hmmsearch 不可执行: {hs}")
+    elif not have(hs):
+        sys.exit("❌ 未找到 hmmsearch，先运行 bash install_step1_deps.sh")
     if not os.path.exists(antifam_hmm):
         sys.exit(f"❌ 找不到 AntiFam HMM: {antifam_hmm}")
 
@@ -120,12 +125,12 @@ def run_antifam(input_fa, antifam_hmm, output_fa, threads=8,
                 for h, s in buf:
                     fh.write(f">{h}\n{s}\n")
             tbl = os.path.join(tmpdir, f"p{part}.tbl")
-            cmd = ["hmmsearch", "--cut_ga", "--cpu", str(threads),
+            cmd = [hs, "--cut_ga", "--cpu", str(threads),
                    "--tblout", tbl, "-o", os.devnull, antifam_hmm, fa]
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode != 0:
                 # --cut_ga 需要 HMM 带 GA 阈值, 回退到 E-value
-                cmd = ["hmmsearch", "-E", str(evalue), "--cpu", str(threads),
+                cmd = [hs, "-E", str(evalue), "--cpu", str(threads),
                        "--tblout", tbl, "-o", os.devnull, antifam_hmm, fa]
                 subprocess.run(cmd, capture_output=True, text=True)
             if os.path.exists(tbl):
@@ -234,6 +239,10 @@ def main():
     a.add_argument("--output", required=True, help="过滤后 FASTA")
     a.add_argument("--report", default=None, help="被剔除 ID 清单")
     a.add_argument("--threads", type=int, default=8)
+    a.add_argument("--chunk", type=int, default=500000,
+                   help="每批送入 hmmsearch 的序列数(控制内存)")
+    a.add_argument("--hmmsearch-bin", default="hmmsearch",
+                   help="hmmsearch 可执行文件路径(环境按 -p 创建时需指定绝对路径)")
     a.add_argument("--evalue", type=float, default=1e-3)
 
     b = sub.add_parser("smorfinder", help="核酸 contigs 真实性注释")
@@ -254,8 +263,10 @@ def main():
         print("  AntiFam: 专门收录伪基因预测产物的 HMM 库 (EBI, Database 2012)")
         print("  背景: 短肽基因预测未过滤时假阳性可达 61.2% (MACREL 2019)")
         print("=" * 70)
-        run_antifam(args.input, args.antifam_db, args.output,
-                    args.threads, args.evalue, args.report)
+        run_antifam(input_fa=args.input, antifam_hmm=args.antifam_db,
+                    output_fa=args.output, threads=args.threads,
+                    evalue=args.evalue, report=args.report,
+                    chunk=args.chunk, hmmsearch_bin=args.hmmsearch_bin)
         print(f"✅ 输出: {args.output}")
 
     else:
