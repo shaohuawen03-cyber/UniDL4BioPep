@@ -57,10 +57,12 @@ Cell 2024 的 SEP 研究即在 AmPEP 活性预测之外, 另用 SmORFinder
 import os
 import re
 import sys
+import time
 import glob
 import gzip
 import shutil
 import argparse
+import concurrent.futures as cf
 import subprocess
 import tempfile
 
@@ -96,11 +98,41 @@ def iter_fasta(path):
 # 路径 B: AntiFam (蛋白序列)
 # ==========================================
 
+def _dedup_pass(input_fa, tmpdir):
+    """
+    第 1 遍: 按序列去重。
+    宏基因组 sORF 目录中同一短肽常被大量样本重复收录, 去重后送检序列
+    通常只剩原来的一小部分, 这是最有效的加速手段。
+    返回 (uniq_fa 路径, n_total, n_uniq)。
+    """
+    uniq_fa = os.path.join(tmpdir, "uniq.faa")
+    seen = {}
+    n_total = 0
+    with open(uniq_fa, "w") as out:
+        for h, seq in iter_fasta(input_fa):
+            n_total += 1
+            if seq not in seen:
+                idx = len(seen)
+                seen[seq] = idx
+                out.write(f">u{idx}\n{seq}\n")
+    return uniq_fa, n_total, seen
+
+
 def run_antifam(input_fa, antifam_hmm, output_fa, threads=8,
                 evalue=1e-3, report=None, chunk=500000,
-                hmmsearch_bin="hmmsearch"):
+                hmmsearch_bin="hmmsearch", workers=0, dedup=True,
+                keep_tmp=False):
     """
     用 hmmsearch 对 AntiFam 比对, 移除命中的 spurious ORF。
+
+    性能说明
+    --------
+    hmmsearch 的 --cpu 只在 MSV 阶段并行, 超过 ~8 线程几乎不再加速。
+    真正有效的加速是:
+      1) 序列去重 (dedup)  —— 宏基因组目录冗余极高, 常能省掉大部分工作量
+      2) 分块 + 多进程并行 (workers) —— 每个进程独立跑 hmmsearch, 近线性扩展
+      3) 单遍写出 (不再二次读取输入)
+
     返回 (n_total, n_spurious)。
     """
     hs = hmmsearch_bin or "hmmsearch"
@@ -111,28 +143,68 @@ def run_antifam(input_fa, antifam_hmm, output_fa, threads=8,
         sys.exit("❌ 未找到 hmmsearch，先运行 bash install_step1_deps.sh")
     if not os.path.exists(antifam_hmm):
         sys.exit(f"❌ 找不到 AntiFam HMM: {antifam_hmm}")
+    if not os.path.exists(antifam_hmm + ".h3i"):
+        print(f"   ⚠️ {antifam_hmm} 未 hmmpress, 建议先建索引以加速")
 
-    spurious = set()
-    n_total = 0
+    ncpu = os.cpu_count() or 8
+    if workers <= 0:
+        # hmmsearch 单进程超过 ~4 线程收益很低, 用多进程铺满 CPU
+        workers = max(1, min(16, ncpu // 4))
+    per_cpu = max(1, min(4, ncpu // workers))
+
     tmpdir = tempfile.mkdtemp(prefix="antifam_")
+    t0 = time.time()
     try:
-        buf, part = [], 0
-        def flush(buf, part):
-            if not buf:
-                return
-            fa = os.path.join(tmpdir, f"p{part}.faa")
-            with open(fa, "w") as fh:
-                for h, s in buf:
-                    fh.write(f">{h}\n{s}\n")
-            tbl = os.path.join(tmpdir, f"p{part}.tbl")
-            cmd = [hs, "--cut_ga", "--cpu", str(threads),
-                   "--tblout", tbl, "-o", os.devnull, antifam_hmm, fa]
-            r = subprocess.run(cmd, capture_output=True, text=True)
+        # ---------- 第 1 遍: 去重 ----------
+        if dedup:
+            uniq_fa, n_total, seen = _dedup_pass(input_fa, tmpdir)
+            n_uniq = len(seen)
+            saved = (1 - n_uniq / n_total) * 100 if n_total else 0
+            print(f"   去重: {n_total:,} → {n_uniq:,} 条唯一序列 "
+                  f"(省去 {saved:.1f}% 的比对量)")
+            search_fa = uniq_fa
+            n_search = n_uniq
+        else:
+            seen = None
+            n_total = sum(1 for _ in iter_fasta(input_fa))
+            search_fa = input_fa
+            n_search = n_total
+
+        # ---------- 切分 ----------
+        parts, buf, part = [], [], 0
+        for h, seq in iter_fasta(search_fa):
+            buf.append((h.split()[0], seq))
+            if len(buf) >= chunk:
+                fp = os.path.join(tmpdir, f"p{part}.faa")
+                with open(fp, "w") as fh:
+                    for a, b in buf:
+                        fh.write(f">{a}\n{b}\n")
+                parts.append(fp)
+                buf, part = [], part + 1
+        if buf:
+            fp = os.path.join(tmpdir, f"p{part}.faa")
+            with open(fp, "w") as fh:
+                for a, b in buf:
+                    fh.write(f">{a}\n{b}\n")
+            parts.append(fp)
+        del buf
+
+        print(f"   比对: {n_search:,} 条 / {len(parts)} 块 "
+              f"/ {workers} 进程 × {per_cpu} 线程")
+
+        # ---------- 并行 hmmsearch ----------
+        def _one(fp):
+            tbl = fp + ".tbl"
+            base = [hs, "--cpu", str(per_cpu), "--noali",
+                    "--tblout", tbl, "-o", os.devnull]
+            r = subprocess.run(base + ["--cut_ga", antifam_hmm, fp],
+                               capture_output=True, text=True)
             if r.returncode != 0:
-                # --cut_ga 需要 HMM 带 GA 阈值, 回退到 E-value
-                cmd = [hs, "-E", str(evalue), "--cpu", str(threads),
-                       "--tblout", tbl, "-o", os.devnull, antifam_hmm, fa]
-                subprocess.run(cmd, capture_output=True, text=True)
+                r = subprocess.run(base + ["-E", str(evalue), antifam_hmm, fp],
+                                   capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(f"hmmsearch 失败: {r.stderr[:400]}")
+            hit = set()
             if os.path.exists(tbl):
                 with open(tbl) as fh:
                     for line in fh:
@@ -140,35 +212,69 @@ def run_antifam(input_fa, antifam_hmm, output_fa, threads=8,
                             continue
                         f = line.split()
                         if f:
-                            spurious.add(f[0])
+                            hit.add(f[0])
+                os.remove(tbl)
+            os.remove(fp)
+            return hit
 
-        for h, s in iter_fasta(input_fa):
-            n_total += 1
-            buf.append((h.split()[0], s))
-            if len(buf) >= chunk:
-                flush(buf, part)
-                buf, part = [], part + 1
-        flush(buf, part)
+        spurious = set()
+        done = 0
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            for hit in ex.map(_one, parts):
+                spurious |= hit
+                done += 1
+                el = time.time() - t0
+                rate = done / len(parts)
+                eta = el / rate - el if rate > 0 else 0
+                print(f"      [{done}/{len(parts)}] 累计 spurious "
+                      f"{len(spurious):,} | 已用 {el/60:.1f} 分 "
+                      f"| 预计剩余 {eta/60:.1f} 分", flush=True)
+
+        # ---------- 写出 ----------
+        if dedup:
+            # spurious 是 u<idx> 形式, 映射回序列
+            bad_idx = {int(x[1:]) for x in spurious if x.startswith("u")}
+            bad_seq = {sq for sq, i in seen.items() if i in bad_idx}
+            n_spur_uniq = len(bad_seq)
+            del seen
+            n_kept = 0
+            n_removed = 0
+            with open(output_fa, "w") as out:
+                for h, sq in iter_fasta(input_fa):
+                    if sq in bad_seq:
+                        n_removed += 1
+                        continue
+                    out.write(f">{h}\n{sq}\n")
+                    n_kept += 1
+            rate = n_removed / n_total * 100 if n_total else 0
+            print(f"   总数 {n_total:,} | spurious {n_removed:,} ({rate:.2f}%) "
+                  f"[{n_spur_uniq:,} 条唯一序列] | 保留 {n_kept:,}")
+            if report:
+                with open(report, "w") as fh:
+                    fh.write("spurious_sequence\n")
+                    for sq in sorted(bad_seq):
+                        fh.write(sq + "\n")
+            return n_total, n_removed
+        else:
+            n_kept = 0
+            with open(output_fa, "w") as out:
+                for h, sq in iter_fasta(input_fa):
+                    if h.split()[0] in spurious:
+                        continue
+                    out.write(f">{h}\n{sq}\n")
+                    n_kept += 1
+            rate = len(spurious) / n_total * 100 if n_total else 0
+            print(f"   总数 {n_total:,} | spurious {len(spurious):,} "
+                  f"({rate:.2f}%) | 保留 {n_kept:,}")
+            if report:
+                with open(report, "w") as fh:
+                    fh.write("spurious_id\n")
+                    for x in sorted(spurious):
+                        fh.write(x + "\n")
+            return n_total, len(spurious)
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-    n_kept = 0
-    with open(output_fa, "w") as out:
-        for h, s in iter_fasta(input_fa):
-            if h.split()[0] in spurious:
-                continue
-            out.write(f">{h}\n{s}\n")
-            n_kept += 1
-
-    rate = len(spurious) / n_total * 100 if n_total else 0
-    print(f"   总数 {n_total:,} | 判为 spurious {len(spurious):,} ({rate:.2f}%) "
-          f"| 保留 {n_kept:,}")
-    if report:
-        with open(report, "w") as fh:
-            fh.write("spurious_id\n")
-            for s in sorted(spurious):
-                fh.write(s + "\n")
-    return n_total, len(spurious)
+        if not keep_tmp:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ==========================================
@@ -239,8 +345,14 @@ def main():
     a.add_argument("--output", required=True, help="过滤后 FASTA")
     a.add_argument("--report", default=None, help="被剔除 ID 清单")
     a.add_argument("--threads", type=int, default=8)
-    a.add_argument("--chunk", type=int, default=500000,
-                   help="每批送入 hmmsearch 的序列数(控制内存)")
+    a.add_argument("--chunk", type=int, default=100000,
+                   help="每块序列数(越小并行粒度越细)")
+    a.add_argument("--workers", type=int, default=0,
+                   help="并行 hmmsearch 进程数(0=按 CPU 自动)。"
+                        "注意: hmmsearch --cpu 超过 ~8 几乎不再加速, "
+                        "多进程才能铺满 CPU")
+    a.add_argument("--no-dedup", action="store_true",
+                   help="关闭序列去重(默认开启; 宏基因组冗余高, 去重能大幅提速)")
     a.add_argument("--hmmsearch-bin", default="hmmsearch",
                    help="hmmsearch 可执行文件路径(环境按 -p 创建时需指定绝对路径)")
     a.add_argument("--evalue", type=float, default=1e-3)
@@ -266,7 +378,8 @@ def main():
         run_antifam(input_fa=args.input, antifam_hmm=args.antifam_db,
                     output_fa=args.output, threads=args.threads,
                     evalue=args.evalue, report=args.report,
-                    chunk=args.chunk, hmmsearch_bin=args.hmmsearch_bin)
+                    chunk=args.chunk, hmmsearch_bin=args.hmmsearch_bin,
+                    workers=args.workers, dedup=not args.no_dedup)
         print(f"✅ 输出: {args.output}")
 
     else:

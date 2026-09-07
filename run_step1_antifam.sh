@@ -23,14 +23,20 @@ if [ -z "$ANTIFAM" ]; then
   done
 fi
 ANTIFAM="${ANTIFAM:-$HOME/db/antifam/AntiFam.hmm}"
-THREADS="${THREADS:-16}"
+# 性能参数
+# hmmsearch --cpu 只在 MSV 阶段并行, 超过 ~8 几乎不再加速。
+# 真正的加速靠"多进程 + 去重", 而非堆 --cpu。
+NPROC=$(nproc)
+WORKERS="${WORKERS:-$(( NPROC / 4 > 16 ? 16 : (NPROC / 4 < 1 ? 1 : NPROC / 4) ))}"
+CHUNK="${CHUNK:-100000}"
+THREADS="${THREADS:-4}"          # 每个 hmmsearch 进程的 --cpu
 FILTER="${1:-}"
 
 echo "=========================================================="
 echo " 第 1 步: AntiFam smORF 真实性过滤"
 echo " 输入: $CATALOG"
 echo " 输出: $CLEAN"
-echo " 线程: $THREADS"
+echo " CPU : $NPROC 核 → $WORKERS 进程 × $THREADS 线程 | 块大小 $CHUNK | 去重 开启"
 echo "=========================================================="
 
 # hmmsearch: 优先用当前环境里的绝对路径(环境可能是 -p 路径创建、名字不可用)
@@ -90,6 +96,8 @@ find "$CATALOG" -mindepth 2 -name '*.fa' | sort | while read -r fa; do
       --output "$out" \
       --report "$rep" \
       --threads "$THREADS" \
+      --workers "$WORKERS" \
+      --chunk "$CHUNK" \
       --hmmsearch-bin "$HMMSEARCH" 2>&1 | tee -a "$LOG"
 done
 
