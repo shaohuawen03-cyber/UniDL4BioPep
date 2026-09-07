@@ -358,3 +358,81 @@ conda install -c bioconda cd-hit diamond
 - 端到端验证：在 200 个背景家族中植入 5 个递增家族（2→8→20→45→90），
   全部检出且**零假阳性**。
 - BH FDR 实现经标准算例核对。
+
+---
+
+## 10. smORF 真实性过滤（前置第一步）
+
+### 10.1 必要性
+
+短肽的基因预测假阳性率极高：降低长度阈值而不加过滤时，**可达 61.2% 的预测
+smORF 是假阳性**（MACREL, *bioRxiv* 2019.12.17.880385，引 Sberro et al. 2019）。
+
+"是不是 AMP"与"是不是真实编码基因"是**两道独立关卡**。Cell 2024 的 SEP 研究
+即在 AmPEP 活性预测之外，另用 SmORFinder 确认候选是高置信编码基因
+（DOI 10.1016/j.cell.2024.05.031）。
+
+### 10.2 为什么放在第一步
+
+- **算力**：假阳性最高 61.2%，先过滤能让后续所有模型少跑一半以上序列
+- **逻辑**：Cell 2024 是先 AmPEP 后 SmORFinder，因其需先把 44 万家族缩到 1.1 万；
+  本项目瓶颈在算力（4.3 亿条），倒序更划算
+
+### 10.3 两条路径
+
+| 路径 | 工具 | 输入 | 依据 |
+|---|---|---|---|
+| A | SmORFinder | **核酸 contigs** | Durrant & Bhatt, *Cell Host Microbe* 2020, DOI 10.1016/j.chom.2020.11.002 |
+| B | AntiFam | **蛋白序列** | Eberhardt et al., *Database* 2012 (EBI) |
+
+**SmORFinder** 组合 pHMM（4,500+ smORF 家族）+ 两个深度学习模型（DSN1/DSN2），
+预测结果富集 Ribo-seq 翻译信号。默认判据为 pHMM E<1.0 **或** DSN1>0.5 **或**
+DSN2>0.5；作者另建议"用宽松阈值但要求三个模型同时满足"来收紧候选，脚本以
+`--strict` 实现。**限制**：SmORFinder 是 Prodigal 之上的过滤层，只接受核酸序列。
+
+**AntiFam** 是专门收录"伪基因预测产物"的 HMM 库，被 Pfam/UniProt/GMSC 等用于
+清理错误 ORF 预测。本项目输入已是氨基酸 sORF，故以路径 B 为主。
+
+---
+
+## 11. Ma et al. 2022 模型（ATT / LSTM）的引入
+
+### 11.1 只用 ATT+LSTM 而不含 BERT 的依据
+
+原研究（Ma et al., *Nat Biotechnol* 2022）以 ATT+LSTM+BERT 组合取得最高
+AUPRC（0.9244）。但**去掉 BERT 有直接文献先例**：
+
+《Antimicrobial Peptides From the Gut Microbiome of the Centenarians》
+（*J Gerontol A Biol Sci* 2024）明确写道：在 ATT、LSTM、BERT 三个高精度模型中
+**"我们选择其中两个（ATT 和 LSTM）作为本研究使用的模型"**，同样以 score > 0.5
+判阳，用于百岁老人肠道宏基因组的 c_AMP 挖掘与人群分组比较——与本项目场景高度
+一致。
+
+另有 *Nature* 2024（全球海洋微生物）用全部三个模型，要求**三者 score 均 > 0.5**。
+两种做法均有据可依。
+
+### 11.2 实现要点
+
+- **编码方式**复刻官方 `format.pl`：整数映射（A=1 … Y=20）+ **左侧零填充至 300 维**。
+  已验证与官方脚本输出一致。
+- **长度域限制**：马跃模型训练数据为 **≤50 aa**（`getorf -maxsize 150` nt，
+  仓库亦标明"Test set data under 50AA"）。而 Macrel 为 10–100 aa、
+  UniDL4BioPep 为 11–180 aa。**三者长度域不一致**，故对 >50 aa 的序列
+  输出 `NaN` 而非外推，避免超出训练域的不可信预测。
+- **环境隔离**：模型为旧版 Keras `.h5` + 自定义 `Attention_layer`
+  （依赖 `keras.engine.topology`），需 TF 1.15 / Keras 2.2.4 独立环境。
+
+### 11.3 当前工具组合
+
+| 工具 | 特征 | 算法 | 长度域 | 训练正负比 |
+|---|---|---|---|---|
+| Macrel | 22 混合理化描述符 | 随机森林 | 10–100 aa | 极低正例（贴近真实） |
+| UniDL4BioPep | ESM-2 嵌入（320 维） | CNN | 11–180 aa | 1:2.5 |
+| Ma-ATT | 整数编码序列 | Attention | ≤50 aa | 1:10 |
+| Ma-LSTM | 整数编码序列 | LSTM | ≤50 aa | 1:10 |
+
+四条独立技术路线（理化描述符 / 蛋白语言模型 / 注意力 / 循环网络），
+误差不相关，共识才有统计意义。
+
+**注意**：因长度域不同，`n_tools_positive` 对 >50 aa 的序列最多只能得 2 票。
+统计时应**按长度分层**，或将分析限定在 ≤50 aa 区间以保证各组可比。
