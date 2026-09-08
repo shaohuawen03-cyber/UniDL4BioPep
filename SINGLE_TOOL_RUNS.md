@@ -1,64 +1,78 @@
-# 单工具拆分跑：Macrel 与 UniDL4BioPep 各自全量
+# Macrel 单工具补跑 + 与 UniDL4BioPep 对比
 
-> 目的：把原来"双工具共识"流程拆成两条独立的单工具全量跑，
-> 让每个工具的判阳率、阈值敏感性、以及它对最终候选集的**实际贡献**
-> 都能单独量化。
-
----
-
-## 0. 为什么要拆
-
-原来 `run_full_pipeline.sh` 第 2 步是共识流程：序列先过 ESM-2 编码 +
-UniDL4BioPep 打分，再与 Macrel 取交集（`--min-consensus-frac 1.0`）。
-这带来两个问题：
-
-1. **归因不清**：最终候选集是两个工具的交集，无法回答"这个数是谁决定的"。
-2. **速度**：Macrel 要白等 ESM-2 + CNN 那一段时间，而那段时间在总耗时里占大头。
-
-拆开之后：
-
-| | Macrel 单工具 | UniDL4BioPep 单工具 |
-|---|---|---|
-| 脚本 | `run_step2a_macrel_only.sh` → `run_macrel_only.py` | `run_step2b_unidl_only.sh` → `run_amp_sorf_cohorts.py --no-macrel` |
-| 依赖 | numpy / pandas + macrel 二进制 | 额外需要 torch / esm / tensorflow / keras |
-| 是否加载 ESM-2 | **否** | 是 |
-| 是否跑 CNN | **否** | 是 |
-| 长度域 | 10–100 aa（Macrel 训练域） | 11–180 aa（AMP 训练域） |
-| 输出目录 | `Predictions_Macrel_final/` | `Predictions_UniDL_final/` |
-| 相对耗时 | 快（只有 Macrel 的 ONNX 前向 + 理化预筛） | 慢（ESM-2 编码 + CNN 预测） |
-
-两者的输出文件结构**完全同构**，`amp_group_stats.py` 与
-`amp_ad_association.py` 可以直接读任意一个目录。
+> 你的计划：**正在跑的那个任务不停**，等它跑完后**单独补一次 Macrel 全量**，
+> 然后对比两个工具。本文档就是这个流程。
+>
+> **不清空任何已有结果。** 所有输出都写到新目录，互不覆盖。
 
 ---
 
-## 1. 跑之前：清理上一次的结果
+## 0. 先纠正一件事：正在跑的不是"UniDL4BioPep 单工具"
 
-```bash
-# 先看要删什么（默认不删）
-bash clean_previous_runs.sh
+`run_full_pipeline.sh` 第 2 步的标题就是 `▶ [2/4] Macrel + UniDL4BioPep 共识预测`，
+参数里同时有 `--macrel-threshold` 和 `--threshold`，**没有 `--no-macrel`**。
+你日志里这两行也对得上：
 
-# 确认后真删
-APPLY=1 bash clean_previous_runs.sh
+```
+🗳 共识工具数: 2  (模式: frac)
+   chunk32: 打分 2,935,609 | AMP 1,932,099 | Macrel 860 | 共识≥2 810
 ```
 
-默认**保留** `clean_catalog/`（AntiFam 过滤后的 sORF，重建要重跑第 1 步，很贵）。
-只有确定要连第 1 步一起重做时才加 `KEEP_CLEAN=0`。
+`AMP` 和 `Macrel` 是**每个工具各自的判阳数**（`run_amp_sorf_cohorts.py:931`），
+`共识≥2` 才是交集。所以它是一次双工具共识跑。
 
-清理范围：`Predictions_AMP_final/`（原共识跑）、`Predictions_Macrel_final/`、
-`Predictions_UniDL_final/`、`Predictions_*_run*/`、`pipeline_*.log`、
-`macrel_only_*.log`、`unidl_only_*.log`、`full_run.log`、`full_run.pid`、`__pycache__/`。
+### 但这反而省了你一大步
 
-> ⚠️ 原共识跑的 `Predictions_AMP_final/` 里的 `*_AMP_hits.csv` 保存了
-> `Macrel_prob` 和 `UniDL_AMP_prob` 两列原始概率。**如果还想用它做第 3 节的
-> 淘汰率分析，先把它挪到别处再清理**：
-> ```bash
-> mv ~/UniDL4BioPep-main/Predictions_AMP_final ~/UniDL4BioPep-main/Predictions_AMP_consensus_keep
-> ```
+共识跑的 `summary.json` 里，**两个工具的计数和多档阈值分布是分开存的**：
+
+| 字段 | 内容 |
+|---|---|
+| `n_hits.AMP` | UniDL4BioPep 自己的判阳数 |
+| `n_hits.Macrel` | Macrel 自己的判阳数 |
+| `n_evaluable_per_tool.AMP` / `.Macrel` | 各自的域内可评分母 |
+| `prob_distribution.AMP.counts_at_threshold` | UniDL4BioPep 在 **0.5 / 0.9 / 0.95 / 0.99 / 0.999** 五档下的判阳数 |
+| `prob_distribution.Macrel.counts_at_threshold` | Macrel 在 **0.5 / 0.7 / 0.9 / 0.95 / 0.99** 五档下的判阳数 |
+
+也就是说：**"UniDL4BioPep 在各阈值下判阳多少、判阳率多高"这张表，
+现在这次跑完就有了，不需要再单独跑一遍 ESM-2 + CNN。**
+
+`compare_macrel_vs_unidl.py` 已经支持直接把共识跑目录当 `--unidl-dir` 传进去，
+它会自动从里面取 `AMP` 那一栏，并且**按该工具自己的计数重算判阳率**
+（不会误用 `literature_benchmark` 里那个共识数）。
+
+### 唯一还缺的东西
+
+共识跑的 `*_AMP_hits.csv` **只存交集**（`共识≥2`，那 810 条），
+不含"UniDL4BioPep 判阳但 Macrel 判阴"的 193 万条。
+
+所以要不要再单独跑一次 UniDL4BioPep（`run_step2b_unidl_only.sh`），
+取决于你要不要那份 **UniDL4BioPep 单独的候选肽序列清单**：
+
+| 你的目的 | 要不要单独跑 UniDL4BioPep |
+|---|---|
+| 只要判阳率、阈值敏感性、"筛选有没有效果"的结论 | **不用**，共识跑的 summary 就够 |
+| 要拿 UniDL4BioPep 单独的候选肽去做 CD-HIT 家族聚类 / AD 关联 | 要，`run_step2b_unidl_only.sh` |
 
 ---
 
-## 2. 第 2a 步：Macrel 单工具全量（先跑这个）
+## 1. 等当前任务跑完
+
+```bash
+# 看进度
+tail -f ~/UniDL4BioPep-main/full_run.log
+
+# 确认是否已结束
+ps -p "$(cat ~/UniDL4BioPep-main/full_run.pid)" && echo "还在跑" || echo "已结束"
+```
+
+**别删 `Predictions_AMP_final/`。** 它是后面对比的输入。
+
+---
+
+## 2. 单独跑 Macrel 全量
+
+不加载 ESM-2、不加载 TensorFlow，只依赖 numpy / pandas + macrel 二进制，
+比共识跑快得多。
 
 ```bash
 cd ~/UniDL4BioPep-main
@@ -74,95 +88,94 @@ tail -f macrel_full.log
 bash run_step2a_macrel_only.sh Cohort2
 ```
 
+输出目录 `Predictions_Macrel_final/`，**与共识跑的 `Predictions_AMP_final/` 分开**，
+不会互相覆盖。
+
 可调参数（都是环境变量）：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MACREL_TH` | `0.5` | Macrel 官方判阳阈值。之前共识流程用的 0.9 是精确率优先；单工具全量建议回到 0.5，其余档位看 summary 里的多档阈值表即可，**不用重跑** |
+| `MACREL_TH` | `0.5` | Macrel 官方判阳阈值。共识跑用的是 0.9（精确率优先）。这里回到 0.5，其余档位看 summary 的多档阈值表，**不用重跑** |
 | `MACREL_BIN` | `~/miniconda3/envs/env_macrel/bin/macrel` | |
 | `MACREL_THREADS` | `8` | |
-| `MIN_CHARGE` | `2.0` | 理化预筛净电荷下限 |
+| `MIN_CHARGE` | `2.0` | 理化预筛净电荷下限，与共识跑一致 |
 | `MAX_LEN` | `100` | Macrel 训练域上界。传 `180` 可与 UniDL4BioPep 同口径，但 100–180 段对 Macrel 属**域外**，不计入其判阳 |
-| `CHUNK` | `200000` | 每 chunk 的序列数（长度过滤后计） |
+| `CHUNK` | `200000` | 每 chunk 序列数（长度过滤后计） |
 | `OUT` | `$ROOT/Predictions_Macrel_final` | |
 | `FORCE` | `0` | `1` = 忽略已有 summary/检查点强制重跑 |
 
-想看**纯 Macrel**判阳率（不做理化预筛）：
+断点续跑：重新执行同一条命令即可，已完成的组自动跳过，
+未完成的组从最后一个 chunk 之后继续（检查点在 `<OUT>/.ckpt/`）。
+
+想看**纯 Macrel**判阳率（关掉理化预筛）：
 
 ```bash
-python -u run_macrel_only.py --catalog-dir ~/UniDL4BioPep-main/clean_catalog \
-    --output-dir ~/UniDL4BioPep-main/Predictions_Macrel_nofilter \
-    --macrel-bin ~/miniconda3/envs/env_macrel/bin/macrel \
+python -u run_macrel_only.py \
+    --catalog-dir ~/UniDL4BioPep-main/clean_catalog \
+    --output-dir  ~/UniDL4BioPep-main/Predictions_Macrel_nofilter \
+    --macrel-bin  ~/miniconda3/envs/env_macrel/bin/macrel \
     --macrel-threads 8 --no-physchem-filter
 ```
 
-断点续跑：重新执行同一条命令即可，已完成的组会自动跳过，
-未完成的组从最后一个 chunk 之后继续（检查点在 `<OUT>/.ckpt/`）。
-
 ---
 
-## 3. 第 2b 步：UniDL4BioPep 单工具全量
+## 3. （可选）单独跑 UniDL4BioPep
+
+只在需要 UniDL4BioPep 单独的候选肽清单时才跑。这一步要重新过一遍
+ESM-2 + CNN，是最慢的一步。
 
 ```bash
 cd ~/UniDL4BioPep-main
-
 THRESHOLD=0.99 nohup bash run_step2b_unidl_only.sh > unidl_full.log 2>&1 &
 echo $! > unidl_full.pid
-tail -f unidl_full.log
 ```
 
-只跑一个队列：
-
-```bash
-THRESHOLD=0.99 bash run_step2b_unidl_only.sh Cohort2
-```
-
-这一步就是原来的 `run_amp_sorf_cohorts.py` 加 `--no-macrel --no-ampep`，
-逻辑没有改动，长度域自动变成 UniDL4BioPep 的 11–180 aa。
-
-跑完自检会打印**多档阈值下的判阳条数**（0.5 / 0.9 / 0.95 / 0.99 / 0.999）。
-这张表是关键证据：
-
-> 如果把阈值推到 0.999，判阳率仍然远高于文献基准 1.65%，
-> 说明 UniDL4BioPep 在本数据上不具备判别力，而不是阈值没调好。
-
-`METHODS_AMP_metagenome.md` 第 7 节其实已经写明：
-*"UniDL4BioPep 的绝对概率不可解释为后验概率（先验错配 + softmax 未校准），
-仅可用于排序。"* 多档阈值表就是把这句话落到具体数字上。
+输出目录 `Predictions_UniDL_final/`。内部就是 `run_amp_sorf_cohorts.py`
+加 `--no-macrel --no-ampep`，长度域自动变成 UniDL4BioPep 的 11–180 aa。
 
 ---
 
 ## 4. 出对比结论
 
 ```bash
-python compare_macrel_vs_unidl.py \
-    --macrel-dir ~/UniDL4BioPep-main/Predictions_Macrel_final \
-    --unidl-dir  ~/UniDL4BioPep-main/Predictions_UniDL_final \
-    --out        ~/UniDL4BioPep-main/cmp
+cd ~/UniDL4BioPep-main
 
-# 加上原来那次共识跑（如果保留了），多出一张"淘汰率"表
+# 常规用法：Macrel 用单工具跑的结果，UniDL 直接复用共识跑
 python compare_macrel_vs_unidl.py \
-    --macrel-dir ~/UniDL4BioPep-main/Predictions_Macrel_final \
-    --unidl-dir  ~/UniDL4BioPep-main/Predictions_UniDL_final \
-    --consensus-dir ~/UniDL4BioPep-main/Predictions_AMP_consensus_keep \
+    --macrel-dir Predictions_Macrel_final \
+    --unidl-dir  Predictions_AMP_final \
+    --consensus-dir Predictions_AMP_final \
     --macrel-th 0.9 --consensus-th 0.99 \
-    --out ~/UniDL4BioPep-main/cmp
+    --out cmp
+
+# 如果第 3 步也跑了，就把 --unidl-dir 换成单工具跑的目录
+python compare_macrel_vs_unidl.py \
+    --macrel-dir Predictions_Macrel_final \
+    --unidl-dir  Predictions_UniDL_final \
+    --consensus-dir Predictions_AMP_final \
+    --macrel-th 0.9 --consensus-th 0.99 \
+    --out cmp
 ```
+
+`--macrel-th 0.9` / `--consensus-th 0.99` 要填**共识跑当时真正用的阈值**
+（你那次是 `MACREL_TH=0.9`、`THRESHOLD=0.99`），否则第 ③ 张表口径不对。
 
 输出四张表：
 
 | 表 | 内容 | 用来说明什么 |
 |---|---|---|
 | ① | 两个工具各自的分组判阳率 + 是否落在文献基准 0.1–1.65% | 哪个工具的绝对判阳率合理 |
-| ② | 多档阈值敏感性（占域内可评序列比例） | 提高阈值能否把判阳率压进基准区间 |
-| ③ | 共识跑里 UniDL4BioPep 各阈值对 Macrel 命中的**淘汰率** | **淘汰率≈0 就是"UniDL4BioPep 那一票不构成筛选"的直接证据** |
+| ② | 多档阈值敏感性（占域内可评序列比例） | 把阈值推到最高档能否压进基准区间 |
+| ③ | 共识跑里 UniDL4BioPep 各阈值对 Macrel 命中的**淘汰率** | **淘汰率≈0 就是"那一票不构成筛选"的直接证据** |
 | ④ | 结论汇总 | 直接可引 |
 
-`--macrel-th` 和 `--consensus-th` 要填**共识跑当时真正用的阈值**
-（那次是 `MACREL_TH=0.9`、`THRESHOLD=0.99`），否则第 ③ 张表口径不对。
+第 ③ 张表**不需要重跑任何预测**——它直接读共识跑 `*_AMP_hits.csv` 里
+已经保存的 `Macrel_prob` / `UniDL_AMP_prob` 两列原始概率。
 
-第 ③ 张表不需要重跑任何预测——它直接读共识跑
-`*_AMP_hits.csv` 里已经保存的 `Macrel_prob` / `UniDL_AMP_prob` 两列。
+> **关于"UniDL4BioPep 筛选没效果"这个结论**：要用第 ③ 张表的淘汰率支撑，
+> 并且**必须写明是在哪个阈值下成立的**。阈值不同结论可能反过来——
+> 淘汰率在 0.99 下可能接近 0，在 0.999 下可能不可忽略。
+> 两个数都写进报告，比只写一个更站得住。
 
 ---
 
@@ -170,23 +183,24 @@ python compare_macrel_vs_unidl.py \
 
 ```bash
 # Macrel 单工具
-python amp_group_stats.py      ~/UniDL4BioPep-main/Predictions_Macrel_final
-python amp_ad_association.py   ~/UniDL4BioPep-main/Predictions_Macrel_final \
-    --min-tools 1 --cohort Cohort3
+python amp_group_stats.py    ~/UniDL4BioPep-main/Predictions_Macrel_final
+python amp_ad_association.py ~/UniDL4BioPep-main/Predictions_Macrel_final \
+    --min-tools 1 --cohort Cohort2
 
-# UniDL4BioPep 单工具
-python amp_group_stats.py      ~/UniDL4BioPep-main/Predictions_UniDL_final
-python amp_ad_association.py   ~/UniDL4BioPep-main/Predictions_UniDL_final \
-    --min-tools 1 --cohort Cohort3
+# 共识跑
+python amp_group_stats.py    ~/UniDL4BioPep-main/Predictions_AMP_final
+python amp_ad_association.py ~/UniDL4BioPep-main/Predictions_AMP_final \
+    --min-tools 2 --cohort Cohort2
 ```
 
 > ### ⚠️ 单工具跑必须传 `--min-tools 1`
 > `amp_ad_association.py` 的 `--min-tools` **默认是 2**（为双工具共识设计）。
 > 单工具跑的 `n_tools_positive` 最大只有 1，用默认值会把候选**全部过滤成 0 条**。
+> 共识跑用默认的 2 是对的。
 
 > ### ⚠️ `run_full_pipeline.sh` 第 4 步不含 Cohort2
-> `run_full_pipeline.sh` 里 AD 关联那一步写死了 `for c in Cohort1 Cohort3`。
-> 现在跑的是 `Cohort2_Matched265_NCvsAD`，要单独补：
+> 那一步写死了 `for c in Cohort1 Cohort3`（`run_full_pipeline.sh:133`）。
+> 你现在跑的是 `Cohort2_Matched265_NCvsAD`，AD 关联要单独补：
 > ```bash
 > python amp_ad_association.py <结果目录> --min-tools 1 --cohort Cohort2
 > ```
@@ -199,36 +213,34 @@ python amp_ad_association.py   ~/UniDL4BioPep-main/Predictions_UniDL_final \
 
 ---
 
-## 6. 结果文件夹结构
-
-两个目录结构一致：
+## 6. 结果文件夹
 
 ```
-Predictions_Macrel_final/                     Predictions_UniDL_final/
-├── summary_all_groups.tsv                    ├── summary_all_groups.tsv
-├── group_stats_*.tsv          (第 5 步产出)   ├── group_stats_*.tsv
-├── AD_association/            (第 5 步产出)   ├── AD_association/
-├── .ckpt/                                    ├── .ckpt/
-│   └── <Cohort>__<Group>.ckpt.json           │   └── <Cohort>__<Group>.ckpt.json
-└── <Cohort>/                                 └── <Cohort>/
-    ├── <Group>_AMP_hits.csv     ← 候选肽全表      ├── <Group>_AMP_hits.csv
-    ├── <Group>_summary.json     ← 核心汇总        ├── <Group>_summary.json
-    ├── <Group>_summary.tsv                        ├── <Group>_summary.tsv
-    └── <Group>_Macrel_prob_hist.npy               └── <Group>_AMP_prob_hist.npy
+Predictions_AMP_final/        ← 正在跑的共识任务（别删）
+Predictions_Macrel_final/     ← 第 2 步新增
+Predictions_UniDL_final/      ← 第 3 步（可选）新增
 ```
 
-`<Group>_summary.json` 里可以直接引用的字段：
+三个目录结构一致：
 
-| 字段 | 含义 |
-|---|---|
-| `funnel.n_raw` → `n_after_len` → `n_after_physchem` → `n_scored` | 逐级漏斗条数 |
-| `n_hits.<工具>` | 判阳条数 |
-| `n_evaluable_per_tool.<工具>` | 该工具**域内可评**条数（分母，不是 n_scored） |
-| `hit_rate_in_domain` | 判阳 / 域内可评 |
-| `literature_benchmark.observed_rate_vs_raw_smorf` | 判阳 / **原始** smORF 数（与文献基准同口径） |
-| `literature_benchmark.verdict` | `in_range` / `above_range` / `below_range` |
-| `prob_distribution.<工具>.counts_at_threshold` | **多档阈值下的判阳条数**（换阈值不用重跑） |
-| `length_strata` | 按长度分层的条数与命中数 |
+```
+<结果目录>/
+├── summary_all_groups.tsv
+├── group_stats_*.tsv           (第 5 步产出)
+├── AD_association/             (第 5 步产出)
+├── cmp_*.tsv                   (第 4 步产出)
+├── .ckpt/
+│   └── <Cohort>__<Group>.ckpt.json
+└── <Cohort>/
+    ├── <Group>_AMP_hits.csv        ← 候选肽全表(含原始概率列)
+    ├── <Group>_summary.json        ← 核心汇总
+    ├── <Group>_summary.tsv
+    └── <Group>_<工具>_prob_hist.npy
+```
+
+`<Group>_summary.json` 里可直接引用的字段见第 0 节的表。
+另外：`funnel.n_raw` → `n_after_len` → `n_after_physchem` → `n_scored`
+是逐级漏斗条数；`length_strata` 是按长度分层的条数与命中数。
 
 ---
 
@@ -236,9 +248,10 @@ Predictions_Macrel_final/                     Predictions_UniDL_final/
 
 1. **判阳率的分母要说清楚。** 三个分母并存：`n_raw`（原始）、`n_scored`
    （长度+理化过滤后）、`n_evaluable`（工具域内）。与文献基准 0.1–1.65%
-   对比时必须用 `observed_rate_vs_raw_smorf`（分母 = `n_raw`）。
-2. **两个工具的长度域不同**，绝对判阳数不可直接相比。Macrel 只看 10–100 aa，
-   UniDL4BioPep 看 11–180 aa。要同口径就把 `MAX_LEN=180` 传给 Macrel，
+   对比时必须用**分母 = `n_raw`** 的那个数。
+   `compare_macrel_vs_unidl.py` 的表 ① 已按此重算，不用自己换算。
+2. **两个工具的长度域不同**（Macrel 10–100 aa，UniDL4BioPep 11–180 aa），
+   绝对判阳数不可直接相比。要同口径就给 Macrel 传 `MAX_LEN=180`，
    并在报告里说明 100–180 段对 Macrel 是域外。
 3. **只报 ρAMP，不报绝对条数**（`amp_group_stats.py` 的既有约定）。
 4. **队列不独立**：Cohort2 是 Cohort1 的两个组，Cohort4 是 Cohort3 的两个组，
@@ -246,10 +259,9 @@ Predictions_Macrel_final/                     Predictions_UniDL_final/
    （`METHODS_AMP_metagenome.md` 第 7.4 条）。
 5. **这是计算预测，不是实验证据。** 文献中即使 7 工具全阳筛选，
    合成后活性率也只有 70–83%。表述应为"候选"。
-6. **"UniDL4BioPep 筛选没效果"这个结论要用第 ③ 张表的淘汰率来支撑**，
-   并且要说清是在**哪个阈值**下成立的。阈值不同结论可能不同：
-   淘汰率在 0.99 下可能接近 0，在 0.999 下可能不可忽略。
-   把两个数都写进报告，比只写一个更站得住。
+6. **UniDL4BioPep 的绝对概率不可解释为后验概率**
+   （`METHODS_AMP_metagenome.md` 第 7.2 条：先验错配 + softmax 未校准，
+   仅可用于排序）。第 ② 张表就是把这句话落到具体数字上。
 
 ---
 
@@ -261,4 +273,4 @@ Predictions_Macrel_final/                     Predictions_UniDL_final/
 | 单工具跑被 `amp_ad_association.py` 默认的 `--min-tools 2` 清空 | 必须显式传 `--min-tools 1`（见第 5 节） |
 | TensorFlow 报 `Could not load dynamic library 'libcufft.so.10'` / `libcusparse.so.11` → `Skipping registering GPU devices` | CNN 落到 CPU 上跑。**结果正确，只是慢。** `LD_LIBRARY_PATH` 里是 cuda-12.8，而 TF 找的是 CUDA 11 时代的 soname，版本对不上 |
 | 日志里 `🖥 设备: cuda` 但 TF 没用上 GPU | 那行是 `torch.cuda.is_available()`，只对 PyTorch/ESM-2 成立，与 TensorFlow 无关 |
-| Macrel 命中率偏低（此前 `MACREL_TH=0.9` 时约 0.029%，低于文献基准下限 0.1%） | 0.9 是精确率优先。单工具全量回到官方默认 0.5，再用 summary 的多档阈值表回看 0.9/0.95 |
+| Macrel 命中率偏低（共识跑 `MACREL_TH=0.9` 时约 0.029%，低于文献基准下限 0.1%） | 0.9 是精确率优先。单工具全量回到官方默认 0.5，再用 summary 的多档阈值表回看 0.9/0.95 |

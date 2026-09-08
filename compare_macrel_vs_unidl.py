@@ -52,8 +52,19 @@ def load(results_dir):
     return out
 
 
-def tool_of(s):
+def tool_of(s, prefer=None):
+    """挑出这份 summary 里要看的工具。
+
+    单工具跑只有一个; 共识跑(run_full_pipeline.sh 第 2 步)的 summary 里
+    每个工具的计数和多档阈值分布【都是分开存的】, 所以共识跑的目录也能
+    直接当作某个工具的单工具结果来读 —— 不必为了拿 UniDL4BioPep 的
+    判阳率再单独跑一遍 ESM-2 + CNN。
+    """
     t = s.get("tools") or []
+    if not t:
+        return None
+    if prefer and prefer in t:
+        return prefer
     return t[0] if len(t) == 1 else None
 
 
@@ -61,20 +72,30 @@ def verdict_mark(r):
     return "✅" if LIT_LO <= r <= LIT_HI else ("⚠️ 偏高" if r > LIT_HI else "⚠️ 偏低")
 
 
-def table_single(summ, label, ths):
+def table_single(summ, label, ths, tool=None):
     print("\n" + "=" * 78)
     print(f"① {label}: 各分组判阳率 (对照文献基准 0.1-1.65%)")
     print("=" * 78)
     rows = []
+    multi = any(len(s.get("tools") or []) > 1 for s in summ.values())
+    if multi:
+        print("   ⚠️ 这是【共识跑】的目录。下表取的是该工具【自己】的判阳条数")
+        print("      (summary 的 n_hits 是分工具存的), 判阳率也按该工具重算,")
+        print("      不是 summary 里 literature_benchmark 那个共识数。")
+    rows = []
     for (coh, grp), s in summ.items():
-        t = tool_of(s) or (s.get("tools") or ["?"])[0]
-        lb = s.get("literature_benchmark", {})
-        r = lb.get("observed_rate_vs_raw_smorf", 0.0)
+        t = tool_of(s, prefer=tool) or (s.get("tools") or ["?"])[0]
+        n_raw = max(s["funnel"]["n_raw"], 1)
+        n_pos = s["n_hits"].get(t, 0)
+        # 分母用 n_raw, 与文献基准 0.1-1.65% 同口径。
+        # 共识跑的 literature_benchmark.observed_rate_vs_raw_smorf 是【共识】
+        # 计数算出来的, 不能拿来当单个工具的判阳率, 这里一律重算。
+        r = n_pos / n_raw
         d = (s.get("prob_distribution", {}).get(t) or {})
         c = d.get("counts_at_threshold") or {}
         row = {"Cohort": coh, "Group": grp, "N_raw": s["funnel"]["n_raw"],
                "N_scored": s["funnel"]["n_scored"],
-               "N_pos": s["n_hits"].get(t, 0),
+               "N_pos": n_pos,
                "判阳率_vs_raw": f"{r * 100:.4f}%",
                "判定": verdict_mark(r)}
         for th in ths:
@@ -88,12 +109,14 @@ def table_single(summ, label, ths):
     return df
 
 
-def table_sensitivity(summ, label, tool, ths):
+def table_sensitivity(summ, label, tool, ths, note=""):
     print("\n" + "=" * 78)
     print(f"② {label}: 多档阈值下的判阳率 (占【打分序列】比例)")
     print(f"   若把阈值推到最高档, 判阳率仍远高于 1.65%,")
     print(f"   说明该工具在本数据上不具备判别力, 而不是阈值没调好。")
     print("=" * 78)
+    if note:
+        print(f"   {note}")
     rows = []
     for (coh, grp), s in summ.items():
         d = (s.get("prob_distribution", {}).get(tool) or {})
@@ -162,8 +185,15 @@ def main():
     ap = argparse.ArgumentParser(
         description="Macrel / UniDL4BioPep 单工具跑结果对比",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--macrel-dir", required=True)
-    ap.add_argument("--unidl-dir", required=True)
+    ap.add_argument("--macrel-dir", default=None,
+                    help="Macrel 结果目录。可以是 Macrel 单工具跑"
+                         "(run_step2a_macrel_only.sh), 也可以是共识跑目录"
+                         " —— 共识跑的 summary 里 Macrel 的计数是单独存的")
+    ap.add_argument("--unidl-dir", default=None,
+                    help="UniDL4BioPep 结果目录。同样可以是共识跑目录: "
+                         "共识跑的 summary 里 UniDL4BioPep 的判阳条数和 "
+                         "0.5/0.9/0.95/0.99/0.999 五档分布都是单独存的, "
+                         "不必为了这张表再单独跑一遍 ESM-2 + CNN")
     ap.add_argument("--consensus-dir", default=None,
                     help="原双工具共识跑的输出目录(可选, 用于第 ③ 张表)")
     ap.add_argument("--consensus-th", default="0.99",
@@ -178,24 +208,34 @@ def main():
     print("=" * 78)
     print("Macrel vs UniDL4BioPep 单工具全量结果对比")
     print("=" * 78)
-    print(f"Macrel  结果目录: {args.macrel_dir}")
-    print(f"UniDL   结果目录: {args.unidl_dir}")
+    if not args.macrel_dir and not args.unidl_dir:
+        raise SystemExit("❌ --macrel-dir / --unidl-dir 至少给一个")
+    print(f"Macrel  结果目录: {args.macrel_dir or '(未提供)'}")
+    print(f"UniDL   结果目录: {args.unidl_dir or '(未提供)'}")
     if args.consensus_dir:
         print(f"共识跑 结果目录: {args.consensus_dir}")
     print(f"文献基准: 真实人肠道宏基因组 smORF 中 AMP 占比 "
           f"{LIT_LO * 100:g}-{LIT_HI * 100:g}% (Macrel, PeerJ 2020)")
 
-    mac = load(args.macrel_dir)
-    uni = load(args.unidl_dir)
-    if not mac:
-        raise SystemExit(f"❌ {args.macrel_dir} 下没有 *_summary.json")
-    if not uni:
-        raise SystemExit(f"❌ {args.unidl_dir} 下没有 *_summary.json")
+    mac = load(args.macrel_dir) if args.macrel_dir else {}
+    uni = load(args.unidl_dir) if args.unidl_dir else {}
+    for tag, d, path in (("macrel", mac, args.macrel_dir),
+                         ("unidl", uni, args.unidl_dir)):
+        if path and not d:
+            raise SystemExit(f"❌ {path} 下没有 *_summary.json")
 
-    t_mac = table_single(mac, "Macrel 单工具", MACREL_THS)
-    t_uni = table_single(uni, "UniDL4BioPep 单工具", UNIDL_THS)
-    table_sensitivity(uni, "UniDL4BioPep", "AMP", UNIDL_THS)
-    table_sensitivity(mac, "Macrel", "Macrel", MACREL_THS)
+    note = ("   (数据取自共识跑目录 —— 其中该工具的计数是单独统计的)"
+            if args.unidl_dir and uni
+            and any(len(s.get("tools") or []) > 1 for s in uni.values())
+            else "")
+    t_mac = table_single(mac, "Macrel", MACREL_THS, tool="Macrel") if mac \
+        else pd.DataFrame()
+    t_uni = table_single(uni, "UniDL4BioPep", UNIDL_THS, tool="AMP") if uni \
+        else pd.DataFrame()
+    if uni:
+        table_sensitivity(uni, "UniDL4BioPep", "AMP", UNIDL_THS, note=note)
+    if mac:
+        table_sensitivity(mac, "Macrel", "Macrel", MACREL_THS)
 
     t_ovl, drop_rates = pd.DataFrame(), []
     if args.consensus_dir:
@@ -207,9 +247,14 @@ def main():
     print("\n" + "=" * 78)
     print("④ 结论")
     print("=" * 78)
-    for name, summ in (("Macrel", mac), ("UniDL4BioPep", uni)):
-        rs = [s.get("literature_benchmark", {})
-              .get("observed_rate_vs_raw_smorf", 0.0) for s in summ.values()]
+    for name, summ, tool in (("Macrel", mac, "Macrel"),
+                             ("UniDL4BioPep", uni, "AMP")):
+        if not summ:
+            continue
+        # 按【该工具自己】的判阳数重算, 不用 literature_benchmark
+        # (共识跑里那个字段是共识计数)
+        rs = [s["n_hits"].get(tool_of(s, prefer=tool) or tool, 0)
+              / max(s["funnel"]["n_raw"], 1) for s in summ.values()]
         if not rs:
             continue
         lo, hi = min(rs) * 100, max(rs) * 100
