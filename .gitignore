@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# 运行产物 (由 run_* 脚本生成, 不入库)
+*.log
+*.pid
+Predictions_*/
+comparable_sorf_grouped_catalog/
+clean_catalog/
+
+# 系统
+.DS_Store

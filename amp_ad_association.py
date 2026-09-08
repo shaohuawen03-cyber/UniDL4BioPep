@@ -392,12 +392,26 @@ def main():
             "CA_p": p, "trend": direction,
         })
     tdf = pd.DataFrame(rows)
-    tdf["CA_q_BH"] = bh_fdr(tdf["CA_p"].values)
-    tdf = tdf.sort_values("CA_p")
-    tdf["CA_p"] = tdf["CA_p"].map(lambda v: f"{v:.3g}" if v == v else None)
-    tdf["CA_q_BH"] = tdf["CA_q_BH"].map(lambda v: f"{v:.3g}" if v == v else None)
+    if tdf.empty:
+        # 家族表为空(候选太少, 或 --min-family-count 过滤后无家族留存)。
+        # pd.DataFrame([]) 没有列, 直接取 CA_p 会 KeyError。
+        print(f"   ⚠️ 无家族通过 --min-family-count "
+              f"{args.min_family_count} 的过滤, 跳过趋势检验。")
+        print("      候选量小时这是正常现象; 可下调 --min-family-count "
+              "(如 2 或 1)后重跑。")
+        pd.DataFrame(columns=["family"] + [f"n_{s}" for s in stages]
+                     + ["total", "CA_z", "CA_p", "CA_q_BH", "trend"]
+                     ).to_csv(os.path.join(out_dir, "family_trend_test.tsv"),
+                              sep="\t", index=False)
+    else:
+        tdf["CA_q_BH"] = bh_fdr(tdf["CA_p"].values)
+        tdf = tdf.sort_values("CA_p")
+        tdf["CA_p"] = tdf["CA_p"].map(lambda v: f"{v:.3g}" if v == v else None)
+        tdf["CA_q_BH"] = tdf["CA_q_BH"].map(
+            lambda v: f"{v:.3g}" if v == v else None)
 
-    sig = tdf[pd.to_numeric(tdf["CA_q_BH"], errors="coerce") < 0.05]
+    sig = tdf[pd.to_numeric(tdf["CA_q_BH"], errors="coerce") < 0.05] \
+        if len(tdf) else tdf
     print(f"   显著趋势家族 (BH q<0.05): {len(sig):,} / {len(tdf):,}")
     if len(sig):
         inc = (sig["trend"] == "increasing").sum()
