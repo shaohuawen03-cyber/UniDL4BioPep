@@ -376,42 +376,63 @@ def main():
     print("=" * 72)
 
     totals = np.array([denom[s] for s in stages], float)
-    rows = []
-    for fam, r in fam_tab.iterrows():
-        cnt = np.array([r[s] for s in stages], float)
-        z, p, direction = cochran_armitage(cnt, totals)
-        rows.append({
-            "family": fam,
-            **{f"n_{s}": int(r[s]) for s in stages},
-            **{f"rho_{s}": (r[s] / denom[s] if denom[s] else 0.0)
-               for s in stages},
-            **{f"nseq_{s}": int(fam_rich.loc[fam, s])
-               if fam in fam_rich.index else 0 for s in stages},
-            "total": int(r["total"]),
-            "CA_z": round(z, 3) if z == z else None,
-            "CA_p": p, "trend": direction,
-        })
-    tdf = pd.DataFrame(rows)
-    if tdf.empty:
-        # 家族表为空(候选太少, 或 --min-family-count 过滤后无家族留存)。
-        # pd.DataFrame([]) 没有列, 直接取 CA_p 会 KeyError。
-        print(f"   ⚠️ 无家族通过 --min-family-count "
-              f"{args.min_family_count} 的过滤, 跳过趋势检验。")
-        print("      候选量小时这是正常现象; 可下调 --min-family-count "
-              "(如 2 或 1)后重跑。")
+    if len(stages) < 3:
+        # Cochran-Armitage 趋势检验靠的是 NC→SCS→SCD→MCI→AD 的【有序性】。
+        # 只有 2 个阶段时它退化成一个两比例检验, 却仍然会输出一个
+        # "趋势" p 值 —— 那是在给两两比较套一个趋势的外壳, 会误导。
+        print(f"\n   ⚠️ 只有 {len(stages)} 个阶段 ({' → '.join(stages)}), "
+              f"不足 3 个。")
+        print("      Cochran-Armitage 趋势检验需要 ≥3 个【有序】阶段, "
+              "这里跳过。")
+        print("      两组比较请看 amp_group_stats.py 的第 ③ 张表"
+              "(两比例 z 检验 + fold_change)。")
+        print("      要做真正的阶段趋势, 用 Cohort1 或 Cohort3"
+              "(NC→SCS→SCD→MCI→AD 五阶段)。")
         pd.DataFrame(columns=["family"] + [f"n_{s}" for s in stages]
                      + ["total", "CA_z", "CA_p", "CA_q_BH", "trend"]
                      ).to_csv(os.path.join(out_dir, "family_trend_test.tsv"),
                               sep="\t", index=False)
+        tdf = pd.DataFrame()
+        sig = tdf
     else:
-        tdf["CA_q_BH"] = bh_fdr(tdf["CA_p"].values)
-        tdf = tdf.sort_values("CA_p")
-        tdf["CA_p"] = tdf["CA_p"].map(lambda v: f"{v:.3g}" if v == v else None)
-        tdf["CA_q_BH"] = tdf["CA_q_BH"].map(
-            lambda v: f"{v:.3g}" if v == v else None)
+        rows = []
+        for fam, r in fam_tab.iterrows():
+            cnt = np.array([r[s] for s in stages], float)
+            z, p, direction = cochran_armitage(cnt, totals)
+            rows.append({
+                "family": fam,
+                **{f"n_{s}": int(r[s]) for s in stages},
+                **{f"rho_{s}": (r[s] / denom[s] if denom[s] else 0.0)
+                   for s in stages},
+                **{f"nseq_{s}": int(fam_rich.loc[fam, s])
+                   if fam in fam_rich.index else 0 for s in stages},
+                "total": int(r["total"]),
+                "CA_z": round(z, 3) if z == z else None,
+                "CA_p": p, "trend": direction,
+            })
+        tdf = pd.DataFrame(rows)
+        if tdf.empty:
+            # 家族表为空(候选太少, 或 --min-family-count 过滤后无家族留存)。
+            # pd.DataFrame([]) 没有列, 直接取 CA_p 会 KeyError。
+            print(f"   ⚠️ 无家族通过 --min-family-count "
+                  f"{args.min_family_count} 的过滤, 跳过趋势检验。")
+            print("      候选量小时这是正常现象; 可下调 --min-family-count "
+                  "(如 2 或 1)后重跑。")
+            pd.DataFrame(columns=["family"] + [f"n_{s}" for s in stages]
+                         + ["total", "CA_z", "CA_p", "CA_q_BH", "trend"]
+                         ).to_csv(
+                             os.path.join(out_dir, "family_trend_test.tsv"),
+                             sep="\t", index=False)
+        else:
+            tdf["CA_q_BH"] = bh_fdr(tdf["CA_p"].values)
+            tdf = tdf.sort_values("CA_p")
+            tdf["CA_p"] = tdf["CA_p"].map(
+                lambda v: f"{v:.3g}" if v == v else None)
+            tdf["CA_q_BH"] = tdf["CA_q_BH"].map(
+                lambda v: f"{v:.3g}" if v == v else None)
 
-    sig = tdf[pd.to_numeric(tdf["CA_q_BH"], errors="coerce") < 0.05] \
-        if len(tdf) else tdf
+    if len(tdf):
+        sig = tdf[pd.to_numeric(tdf["CA_q_BH"], errors="coerce") < 0.05]
     print(f"   显著趋势家族 (BH q<0.05): {len(sig):,} / {len(tdf):,}")
     if len(sig):
         inc = (sig["trend"] == "increasing").sum()

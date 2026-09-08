@@ -104,20 +104,33 @@ files = glob.glob(os.path.join(out, "*", "*_summary.json"))
 if not files:
     print("   ⚠️ 未找到 summary")
     sys.exit(0)
-bad = 0
+n_high = n_low = 0
 print(f"   {'分组':<34} {'共识率':>9}  判定")
 for f in sorted(files):
     s = json.load(open(f))
     lb = s.get("literature_benchmark", {})
     r = lb.get("observed_rate_vs_raw_smorf", 0) * 100
     mark = "✅" if 0.1 <= r <= 1.65 else ("⚠️ 偏高" if r > 1.65 else "⚠️ 偏低")
-    if not (0.1 <= r <= 1.65):
-        bad += 1
+    if r > 1.65:
+        n_high += 1
+    elif r < 0.1:
+        n_low += 1
     print(f"   {os.path.basename(f)[:34]:<34} {r:8.3f}%  {mark}")
-if bad:
-    print(f"\n   ⚠️ {bad} 个分组超出文献基准 0.1-1.65%")
-    print("      建议提高 THRESHOLD 后重跑第 2 步")
-else:
+
+# 方向不能说反: 判阳率偏高要【提高】阈值, 偏低要【降低】阈值。
+if n_high:
+    print(f"\n   ⚠️ {n_high} 个分组【高于】文献基准 1.65%")
+    print("      → 提高 THRESHOLD / MACREL_TH, 或提高 MIN_CHARGE 后重跑第 2 步")
+if n_low:
+    print(f"\n   ⚠️ {n_low} 个分组【低于】文献基准 0.1%")
+    print("      → 阈值偏严。降低 MACREL_TH(官方默认 0.5)、"
+          "或降低 MIN_CHARGE 后重跑第 2 步")
+    print("      → 也可能是输入本身 AMP 就少: 本流程有理化预筛"
+          "(净电荷/疏水比例), 分母又是【原始 smORF】,")
+    print("        口径比文献更严, 偏低不一定代表出错。"
+          "先看各工具单独的判阳率再决定。")
+    print("      → 不要靠提高阈值来解决偏低 —— 那只会更低。")
+if not (n_high or n_low):
     print("\n   ✅ 全部落在文献基准范围内")
 PY
 

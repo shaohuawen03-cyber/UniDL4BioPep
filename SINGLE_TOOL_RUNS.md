@@ -7,7 +7,7 @@
 
 ---
 
-## 0. 先纠正一件事：正在跑的不是"UniDL4BioPep 单工具"
+## 0. 那次跑的不是"UniDL4BioPep 单工具"，是双工具共识
 
 `run_full_pipeline.sh` 第 2 步的标题就是 `▶ [2/4] Macrel + UniDL4BioPep 共识预测`，
 参数里同时有 `--macrel-threshold` 和 `--threshold`，**没有 `--no-macrel`**。
@@ -265,7 +265,61 @@ Predictions_UniDL_final/      ← 第 3 步（可选）新增
 
 ---
 
-## 8. 已知问题记录
+## 8. 已完成那次共识跑的实测结果（4.43 小时，2026-09-08）
+
+| | Disease_AD | Healthy_NC |
+|---|---|---|
+| 原始 smORF | 24,813,729 | 23,347,543 |
+| 打分（长度+理化过滤后） | 8,136,428（32.8% of raw） | 7,703,149（33.0% of raw） |
+| **UniDL4BioPep @0.99** | **5,339,359 = 65.62% of 打分** | **5,033,875 = 65.35% of 打分** |
+| **Macrel @0.9** | **2,461 = 0.0302% of 打分** | **2,416 = 0.0314% of 打分** |
+| 共识 ≥2 | 2,313 = 0.0093% of raw | 2,256 = 0.0097% of raw |
+| **UniDL 淘汰掉的 Macrel 命中** | **6.01%** | **6.62%** |
+
+### 可以直接引用的三条
+
+1. **UniDL4BioPep 在 p ≥ 0.99 下判阳 65% 的打分序列。** ρAMP = 0.2152，
+   是文献基准上限 1.65% 的 **13.0 倍**。这不是阈值问题——0.99 已经是
+   `REPORT_THRESHOLDS` 里第二高的档位。
+2. **UniDL4BioPep 那一票只淘汰掉 6.0–6.6% 的 Macrel 命中。**
+   低于 `compare_macrel_vs_unidl.py` 里 10% 的判据，
+   所以"双工具共识"在效果上等价于 Macrel 单筛。
+3. **组间差异要按效应量读，不能只看 p 值**（`amp_group_stats.py` 报告要点第 3 条）：
+
+   | 工具 | fold_change (AD/NC) | p | 怎么读 |
+   |---|---|---|---|
+   | AMP (UniDL) | 0.998（−0.20%） | 0.000299 | p 显著纯粹因为分母 2300 万；**−0.2% 无实际意义** |
+   | Macrel | 0.958（−4.16%） | 0.138 | 不显著 |
+   | consensus2 | 0.965（−3.5%） | 0.224 | 不显著 |
+   | KS 检验 AMP | D = 0.0040 | 4.55e-54 | 同样是 p 显著、效应量≈0 |
+
+   **在 Cohort2 上，AD 与 NC 的 AMP 密度差异检测不出来。** 这是一个阴性结果，
+   如实报告比硬凑显著性站得住。
+
+### 那次跑的自检给的建议是反的（已修）
+
+日志里 `⚠️ 偏低` 后面跟的是 `建议提高 THRESHOLD 后重跑第 2 步`。
+共识率**低于**基准说明判阳太少，提高阈值只会更低。
+`run_full_pipeline.sh` 的自检已改成按方向分别给建议。
+
+### 第 4 步为什么跳过
+
+`run_full_pipeline.sh:133` 是 `for c in Cohort1 Cohort3`，而你这次只跑了 Cohort2，
+所以 `❌ 未找到任何候选肽`。要补：
+
+```bash
+python amp_ad_association.py ~/UniDL4BioPep-main/Predictions_AMP_final \
+    --min-tools 2 --cohort Cohort2
+```
+
+但**注意**：Cohort2 只有 NC / AD 两个阶段，Cochran-Armitage 趋势检验需要
+≥3 个有序阶段，`amp_ad_association.py` 现在会明确提示并跳过。
+Cohort2 的组间比较看 `amp_group_stats.py` 的第 ③ 张表就够了。
+要做真正的阶段趋势，得跑 Cohort1 或 Cohort3。
+
+---
+
+## 9. 已知问题记录
 
 | 问题 | 处理 |
 |---|---|
@@ -274,3 +328,6 @@ Predictions_UniDL_final/      ← 第 3 步（可选）新增
 | TensorFlow 报 `Could not load dynamic library 'libcufft.so.10'` / `libcusparse.so.11` → `Skipping registering GPU devices` | CNN 落到 CPU 上跑。**结果正确，只是慢。** `LD_LIBRARY_PATH` 里是 cuda-12.8，而 TF 找的是 CUDA 11 时代的 soname，版本对不上 |
 | 日志里 `🖥 设备: cuda` 但 TF 没用上 GPU | 那行是 `torch.cuda.is_available()`，只对 PyTorch/ESM-2 成立，与 TensorFlow 无关 |
 | Macrel 命中率偏低（共识跑 `MACREL_TH=0.9` 时约 0.029%，低于文献基准下限 0.1%） | 0.9 是精确率优先。单工具全量回到官方默认 0.5，再用 summary 的多档阈值表回看 0.9/0.95 |
+| `run_full_pipeline.sh` 自检在判阳率【偏低】时建议"提高 THRESHOLD" | 已修：方向说反了。现在按偏高/偏低分别给建议，并说明本流程有理化预筛 + 分母是原始 smORF，口径比文献更严，偏低不一定代表出错 |
+| `amp_ad_association.py` 对只有 2 个阶段的队列照样跑 Cochran-Armitage 趋势检验 | 已修：<3 个有序阶段时明确提示并跳过，指向 `amp_group_stats.py` 的两比例 z 检验。Cohort2 只有 NC/AD，属于这种情况 |
+| `git fetch` 报 `Repository not found` / `Authentication failed for 'https://ghproxy.net/https://github.com/mqgg5630-cyber/UniDL4BioPep.git/'` | 你本机有个名为 `arena` 的 remote 指向一个**不存在的仓库** `mqgg5630-cyber/UniDL4BioPep`（本项目的仓库是 `shaohuawen03-cyber/UniDL4BioPep`），而且还套了 `ghproxy.net` 代理。先 `git remote -v` 和 `git config --get-regexp 'url\..*insteadof'` 查一下，把 remote 换成 `https://github.com/shaohuawen03-cyber/UniDL4BioPep.git` |
