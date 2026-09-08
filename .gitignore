@@ -12,3 +12,6 @@ clean_catalog/
 
 # 系统
 .DS_Store
+
+# 分步日志
+logs/
